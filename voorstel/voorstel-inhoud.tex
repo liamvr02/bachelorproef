@@ -15,37 +15,35 @@
 \section{Inleiding}%
 \label{sec:inleiding}
 
-Waarover zal je bachelorproef gaan? Introduceer het thema en zorg dat volgende zaken zeker duidelijk aanwezig zijn:
+Steden in het Noordzeegebied worden in toenemende mate geconfronteerd met risico's op zowel wateroverlast als temperatuurstijging 
+als gevolg van klimaatverandering \autocite{EEA2020}.
+Voor de stad Gent vormt hitteoverlast een aantoonbaar klimaatgerelateerd risico.
+Binnen Europese vergelijkingen behoort Gent tot de steden met een relatief hoge kwetsbaarheid voor hitte \autocite{Tapia2017}.
 
-\begin{itemize}
-  \item kaderen thema
-  \item de doelgroep
-  \item de probleemstelling en (centrale) onderzoeksvraag
-  \item de onderzoeksdoelstelling
-\end{itemize}
+Stedelijke gebieden zijn bijzonder gevoelig voor temperatuurstijgingen door het stedelijk hitte-eiland effect.
+Deze Urban heat islands (UHI) worden gedefinieerd als het fenomeen waarbij stedelijke gebieden 
+hogere temperaturen vertonen dan hun omliggende landelijke gebieden \autocite{Phelan2015}.
+Volgens \textcite{Zheng2026} kan het temperatuurverschil oplopen tot 12°C in extreme gevallen.
+Deze studie identificeert stedelijke vergroening als één van de factoren die samenhangen met lagere oppervlaktetemperaturen.
 
-Denk er aan: een typische bachelorproef is \textit{toegepast onderzoek}, wat betekent dat je start vanuit een concrete probleemsituatie in bedrijfscontext, een \textbf{casus}. Het is belangrijk om je onderwerp goed af te bakenen: je gaat voor die \textit{ene specifieke probleemsituatie} op zoek naar een goede oplossing, op basis van de huidige kennis in het vakgebied.
+De stedelijke vergroening in Gent omvat onder meer grootschalige boomaanplanting.
+Hoewel verschillende studies aantonen dat vergroening een positief effect heeft op stedelijk klimaat \autocite{Knight2021, Zheng2026, Phelan2015}, 
+is het kwantitatieve verband tussen boomdensiteit en temperatuur afhankelijk van lokale ruimtelijke kenmerken \autocite{Wang2024}.
+Voor deze reden is het effect van boomplanting moeilijk te beoordelen zonder specifieke onderzoek.
+In Gent ontbreekt een recente, gedetailleerde ruimtelijke analyse die het effect van boomdensiteit op temperatuur 
+kwantificeert rekening houdend met lokale stedelijke kenmerken.
 
-De doelgroep moet ook concreet en duidelijk zijn, dus geen algemene of vaag gedefinieerde groepen zoals \emph{bedrijven}, \emph{developers}, \emph{Vlamingen}, enz. Je richt je in elk geval op it-professionals, een bachelorproef is geen populariserende tekst. Eén specifiek bedrijf (die te maken hebben met een concrete probleemsituatie) is dus beter dan \emph{bedrijven} in het algemeen.
-
-Formuleer duidelijk de onderzoeksvraag! De begeleiders lezen nog steeds te veel voorstellen waarin we geen onderzoeksvraag terugvinden.
-
-Schrijf ook iets over de doelstelling. Wat zie je als het concrete eindresultaat van je onderzoek, naast de uitgeschreven scriptie? Is het een proof-of-concept, een rapport met aanbevelingen, \ldots Met welk eindresultaat kan je je bachelorproef als een succes beschouwen?
+De voorgestelde bachelorproef heeft als doel deze relatie tussen vergroening en temperatuur in Gent te onderzoeken 
+aan de hand van data-analyse.
+Daarnaast kunnen op basis van de analyse prioriteitsgebieden worden geïdentificeerd waar vergroening het meest 
+effectief zou zijn voor temperatuurreductie.
+De resultaten kunnen bijdragen aan een beter onderbouwde evaluatie van stedelijke vergroening als klimaatadaptatiemaatregel.
 
 %---------- Stand van zaken ---------------------------------------------------
 
 \section{Literatuurstudie}%
 \label{sec:literatuurstudie}
 
-Hier beschrijf je de \emph{state-of-the-art} rondom je gekozen onderzoeksdomein, d.w.z.\ een inleidende, doorlopende tekst over het onderzoeksdomein van je bachelorproef. Je steunt daarbij heel sterk op de professionele \emph{vakliteratuur}, en niet zozeer op populariserende teksten voor een breed publiek. Wat is de huidige stand van zaken in dit domein, en wat zijn nog eventuele open vragen (die misschien de aanleiding waren tot je onderzoeksvraag!)?
-
-Je mag de titel van deze sectie ook aanpassen (literatuurstudie, stand van zaken, enz.). Zijn er al gelijkaardige onderzoeken gevoerd? Wat concluderen ze? Wat is het verschil met jouw onderzoek?
-
-Verwijs bij elke introductie van een term of bewering over het domein naar de vakliteratuur, bijvoorbeeld~\autocite{Hykes2013}! Denk zeker goed na welke werken je refereert en waarom.
-
-Draag zorg voor correcte literatuurverwijzingen! Een bronvermelding hoort thuis \emph{binnen} de zin waar je je op die bron baseert, dus niet er buiten! Maak meteen een verwijzing als je gebruik maakt van een bron. Doe dit dus \emph{niet} aan het einde van een lange paragraaf. Baseer nooit teveel aansluitende tekst op eenzelfde bron.
-
-Als je informatie over bronnen verzamelt in JabRef, zorg er dan voor dat alle nodige info aanwezig is om de bron terug te vinden (zoals uitvoerig besproken in de lessen Research Methods).
 
 % Voor literatuurverwijzingen zijn er twee belangrijke commando's:
 % \autocite{KEY} => (Auteur, jaartal) Gebruik dit als de naam van de auteur
@@ -54,31 +52,147 @@ Als je informatie over bronnen verzamelt in JabRef, zorg er dan voor dat alle no
 %   functie heeft in de zin (bv. ``Uit onderzoek door Doll & Hill (1954) bleek
 %   ...'')
 
-Je mag deze sectie nog verder onderverdelen in subsecties als dit de structuur van de tekst kan verduidelijken.
+\subsection{Urban Heat Islands en temperatuurmetingen}
+
+Het stedelijke hitte-eilandeffect (UHI) beschrijft het fenomeen waarbij 
+stedelijke gebieden hogere temperaturen vertonen dan omliggende 
+landelijke gebieden, met temperatuurverschillen tot 12°C in extreme 
+gevallen \autocite{Phelan2015, Zheng2026}. Dit effect wordt veroorzaakt 
+door verharding, verminderde verdamping en afwezigheid van vegetatie.
+
+Om UHI-effecten te kwantificeren worden verschillende meetmethoden 
+gebruikt. \textcite{Moncada-Morales2025} identificeerden in een 
+bibliometrische analyse van 130 studies drie hoofdmethoden: Land Surface 
+Temperature (LST) via satellietbeelden (86 studies), grondgebonden 
+luchttemperatuurmetingen (25 studies), of beide gecombineerd (21 studies).
+
+Dit onderzoek maakt gebruik van LST-data vanwege de hoge ruimtelijke 
+resolutie (30-100m), die essentieel is om gelokaliseerde effecten van 
+individuele bomen en specifieke landgebruikstypen te detecteren. In 
+tegenstelling tot grondgebonden weerstations bieden satellietbeelden 
+volledige ruimtelijke dekking van het studiegebied.
+
+\subsection{Invloed van stedelijke vergroening op temperatuur}
+
+In \textcite{Knight2021} zijn 308 studies beschouwd om een algemene conclusie te trekken 
+rond het effect van stedelijke vergroening op ozon, UV en temperatuur.
+Hierin is gevonden dat luchttemperatuur onder bomen gemiddeld 0.8°C koeler was, 
+terwijl stedelijke bossen gemiddeld 1.6°C koeler waren.
+Deze studie duidt aan dat vergroening een significante impact heeft op temperatuur en menselijke comfort.
+
+Hoewel het koelende effect van vergroening duidelijk is, 
+varieert de sterkte ervan sterk afhankelijk van lokale omstandigheden \autocite{Gao2025, Kim2021}. 
+Studies gebruiken verschillende onderzoeksmethoden en analysemodellen, 
+en dezelfde interventie kan tot verschillende effecten leiden in verschillende stedelijke contexten. 
+Dit maakt het moeilijk om algemene voorspellingen te doen die een vergroeningsbeleid kunnen onderbouwen zonder lokale analyse.
+
+Deze context-afhankelijkheid onderstreept de noodzaak van lokaal-specifiek onderzoek, zoals deze voorgestelde studie voor Gent.
 
 %---------- Methodologie ------------------------------------------------------
 \section{Methodologie}%
 \label{sec:methodologie}
 
-Hier beschrijf je hoe je van plan bent het onderzoek te voeren. Welke onderzoekstechniek ga je toepassen om elk van je onderzoeksvragen te beantwoorden? Gebruik je hiervoor literatuurstudie, interviews met belanghebbenden (bv.~voor requirements-analyse), experimenten, simulaties, vergelijkende studie, risico-analyse, PoC, \ldots?
+Om het effect van vergroening in Gent te beschouwen wordt de volgende methodologie gebruikt.
 
-Valt je onderwerp onder één van de typische soorten bachelorproeven die besproken zijn in de lessen Research Methods (bv.\ vergelijkende studie of risico-analyse)? Zorg er dan ook voor dat we duidelijk de verschillende stappen terug vinden die we verwachten in dit soort onderzoek!
+\subsection{Bronnen van data}
 
-Vermijd onderzoekstechnieken die geen objectieve, meetbare resultaten kunnen opleveren. Enquêtes, bijvoorbeeld, zijn voor een bachelorproef informatica meestal \textbf{niet geschikt}. De antwoorden zijn eerder meningen dan feiten en in de praktijk blijkt het ook bijzonder moeilijk om voldoende respondenten te vinden. Studenten die een enquête willen voeren, hebben meestal ook geen goede definitie van de populatie, waardoor ook niet kan aangetoond worden dat eventuele resultaten representatief zijn.
+Voor deze studie zijn 3 soorten data nodig:
 
-Uit dit onderdeel moet duidelijk naar voor komen dat je bachelorproef ook technisch voldoen\-de diepgang zal bevatten. Het zou niet kloppen als een bachelorproef informatica ook door bv.\ een student marketing zou kunnen uitgevoerd worden.
+\begin{itemize}
+    \item Vergroeningsdata: Open Data Portaal Gent (ODP) \autocite{StadGentBomen}
+    \item Temperatuurdata:
+    \begin{itemize}
+        \item LST-data: Online Global Land Surface Temperature Estimation from Landsat \autocite{Parastatidis2017}
+        \item Andere: UGent MOCCA
+    \end{itemize}
+    \item Landgebruiksdata:
+    \begin{itemize}
+        \item Wegeninformatiesysteem Gent: ODP
+        \item Urban Atlas Land Cover/Land Use 2018
+    \end{itemize}
+\end{itemize}
 
-Je beschrijft ook al welke tools (hardware, software, diensten, \ldots) je denkt hiervoor te gebruiken of te ontwikkelen.
+Gegevens over landgebruik kunnen de onvoorspelbaarheid van lokale weersomstandigheden mitigeren, 
+door een beeld te geven van de geometrie en verharding van de omgeving.
 
-Probeer ook een tijdschatting te maken. Hoe lang zal je met elke fase van je onderzoek bezig zijn en wat zijn de concrete \emph{deliverables} in elke fase?
+\subsection{Fuseren van temperatuurdata}
+
+Zodra temperatuurdata is opgehaald kan de volgende fase gebeuren, namelijk het fuseren van deze data.
+
+LST-data uit \textcite{Parastatidis2017} heeft hoge spatiale resolutie: 30m en 100m, 
+maar lage temporale resolutie: 3 huidig actieve satellieten, met datapunten in Gent ongeveer om de week.
+Dit gebrek aan temporale resolutie is mogelijk te mitigeren door deze data te fuseren met een andere dataset 
+die wel een hoge temporale resolutie heeft, bijvoorbeeld vaste weerstations.
+Deze fusie gebeurt aan de hand van ESTARFM, gedefinieerd in \textcite{Zhu2010}.
+ESTARFM is ideaal voor deze studie omdat het specifiek ontwikkeld is voor het fuseren van metingen afkomstig van remote sensing.
+
+Na het fuseren van LST data met data van weerstations bevat de resulterende dataset zowel hoge spatiale- en temporale resolutie.
+Dat betekent dat er veel meer datapunten zijn om mee te werken, dit zal de nauwkeurigheid van de eventuele analyse verhogen.
+
+\subsection{Data combineren}
+
+Om analyse en voorspelling te doen, worden alle databronnen gecombineerd tot één geïntegreerde dataset.
+
+\subsubsection{Temperatuur- en vergroeningsdata}
+
+De dataset wordt geïnitialiseerd op basis van de gefuseerde LST-data en behoudt dezelfde ruimtelijke resolutie. 
+Voor elke cel wordt het aantal bomen berekend, zowel binnen de cel zelf als in omliggende cellen.
+Er wordt rekening gehouden met de plantdatum van elke boom, 
+zodat het effect van nieuw aangeplante vergroening in de tijd kan worden gevolgd. 
+Tevens wordt bijgehouden of een temperatuurmeting afkomstig is van directe LST-observatie of van ESTARFM-fusie.
+
+\subsubsection{Landgebruiksdata}
+
+Per LST-cel worden landgebruikspercentages berekend uit twee databronnen. 
+Het Wegeninformatiesysteem Gent levert gedetailleerde straatsamenstelling,
+terwijl Urban Atlas 2018 de overige landgebruiksklassen beschrijft.
+
+Beide datasets bevatten een groot aantal landgebruiksklassen. Deze worden 
+gehergroepeerd in categorieën met gelijkaardig effect op klimaat 
+(zie appendix \ref{app:landgebruik} voor de volledige classificatie):
+
+Gent WIS bevat 2 velden per record:
+\begin{itemize}
+    \item Bestemming: Gemotoriseerd verkeer, Langzaam verkeer, Groen, Andere
+    \item Materiaal: Volledig verhard, Semi-permeabel, Onverhard, Andere
+\end{itemize}
+
+Urban Atlas:
+\begin{itemize}
+    \item Hoog verhard stedelijk
+    \item Laag verhard stedelijk 
+    \item Transportinfrastructuur
+    \item Stedelijk groen
+    \item Natuurlijk groen
+    \item Water en wetland
+    \item Kaal/in ontwikkeling
+\end{itemize}
+
+De resulterende dataset houdt dan per cel bij: tijd, temperatuur, aantal bomen, aantal bomen in omgevende cellen, 
+procentuele samenstelling van wegen en procentuele samenstelling van landgebruik in het algemeen.
+
+\subsection{Analyse}
+
+Met deze dataset kan analyse uitgevoerd worden op de relatie tussen temperatuur en boomplanting in verschillende stedelijke contexten in Gent.
+
+De relatie tussen temperatuur en boomdensiteit wordt onderzocht met multiple lineaire regressie,
+uitgevoerd in Python. Dit laat toe om het effect van boomdensiteit te kwantificeren terwijl gecontroleerd wordt 
+voor andere variabelen zoals verhardingsgraad en landgebruik.
+
 
 %---------- Verwachte resultaten ----------------------------------------------
 \section{Verwacht resultaat, conclusie}%
 \label{sec:verwachte_resultaten}
 
-Hier beschrijf je welke resultaten je verwacht. Als je metingen en simulaties uitvoert, kan je hier al mock-ups maken van de grafieken samen met de verwachte conclusies. Benoem zeker al je assen en de onderdelen van de grafiek die je gaat gebruiken. Dit zorgt ervoor dat je concreet weet welk soort data je moet verzamelen en hoe je die moet meten.
-
-Wat heeft de doelgroep van je onderzoek aan het resultaat? Op welke manier zorgt jouw bachelorproef voor een meerwaarde?
-
-Hier beschrijf je wat je verwacht uit je onderzoek, met de motivatie waarom. Het is \textbf{niet} erg indien uit je onderzoek andere resultaten en conclusies vloeien dan dat je hier beschrijft: het is dan juist interessant om te onderzoeken waarom jouw hypothesen niet overeenkomen met de resultaten.
-
+Op basis van de geplande methodologie wordt verwacht dat de multiple 
+lineaire regressie een significant negatief verband zal aantonen tussen 
+boomdensiteit en oppervlaktetemperatuur, in lijn met eerdere bevindingen 
+uit \textcite{Knight2021}. De sterkte van dit effect zal naar verwachting 
+variëren afhankelijk van lokale context: in sterk verharde gebieden wordt 
+een groter koelend effect per boom verwacht dan in reeds groene wijken. 
+Het regressiemodel zal deze effecten kwantificeren met p-waarden en 
+prioriteitsgebieden identificeren waar vergroening het meest effectief 
+zou zijn voor temperatuurreductie. Deze resultaten bieden een empirische 
+onderbouwing voor lokaal klimaatadaptatiebeleid in Gent, 
+waarbij beleidsmakers datagedreven beslissingen kunnen nemen 
+over strategische vergroening om hittestress te mitigeren.

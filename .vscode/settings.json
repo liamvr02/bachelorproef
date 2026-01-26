@@ -119,4 +119,5 @@
         "--shell-escape",
         "%DOC%"
     ],
+    "cSpell.language": "en,nl",
 }
