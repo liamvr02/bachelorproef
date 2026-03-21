@@ -1,0 +1,53 @@
+{
+    "landsats": [
+    {
+        "name": "Landsat 4",
+        "id": "4",
+        "from": "1982/07/01",
+        "to": "1993/12/31",
+        "emissivities": ["NDVI"]
+    },
+    {
+        "name": "Landsat 5",
+        "id": "5",
+        "from": "1984/01/01",
+        "to": "2011/12/31",
+        "emissivities": ["NDVI"]
+    },
+    {
+        "name": "Landsat 5",
+        "id": "5",
+        "from": "2000/03/01",
+        "to": "2011/12/31",
+        "emissivities": ["MODIS", "ASTER"]
+    },
+    {
+        "name": "Landsat 7",
+        "id": "7",
+        "from": "1999/01/01",
+        "to": "2026/03/16",
+        "emissivities": ["NDVI"]
+    },
+    {
+        "name": "Landsat 7",
+        "id": "7",
+        "from": "2000/03/01",
+        "to": "2026/03/16",
+        "emissivities": ["MODIS", "ASTER"]
+    },
+    {
+        "name": "Landsat 8",
+        "id": "8",
+        "from": "2013/03/01",
+        "to": "2026/03/16",
+        "emissivities": ["NDVI", "MODIS", "ASTER"]
+    },
+    {
+        "name": "Landsat 9",
+        "id": "9",
+        "from": "2021/11/01",
+        "to": "2026/03/16",
+        "emissivities": ["ASTER"]
+    }
+]
+}

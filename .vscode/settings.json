@@ -120,4 +120,8 @@
         "%DOC%"
     ],
     "cSpell.language": "en,nl",
+    "python.defaultInterpreterPath": "C:\\Users\\liamv\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+    "cSpell.words": [
+        "ghent"
+    ],
 }
