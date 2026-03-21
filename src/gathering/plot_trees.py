@@ -7,7 +7,7 @@ from typing import List, Tuple
 from pathlib import Path
 from datetime import date
 from ghent_polygon import get_ghent_convex_hull, get_ghent_outers
-from gather_trees import get_csv as get_trees
+from gather_trees import get_trees_csv as get_trees
 
 OUTPUT_FILE = Path(__file__).parent.absolute() / f"plot_trees.result.png"
 

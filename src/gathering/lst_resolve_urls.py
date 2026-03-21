@@ -58,7 +58,7 @@ def resolve_lst_urls(url_dicts: List[dict], output_file: Path, tsleep: int = 30)
             sleep(tsleep)
 
 
-if __name__ == "__main__":
+def download_lst_urls():
     tqdm.write("Generating Ghent polygon...")
     polygon_coords = get_ghent_convex_hull()
 
@@ -71,3 +71,6 @@ if __name__ == "__main__":
     fp = Path(__file__).parent.absolute() / f"lst_responses_{date.today()}.jsonl"
 
     resolve_lst_urls(url_dicts, fp, tsleep=1)
+
+if __name__ == "__main__":
+    download_lst_urls()

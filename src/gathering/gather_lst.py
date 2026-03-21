@@ -76,7 +76,7 @@ def download_file(
         return None
 
 
-if __name__ == "__main__":
+def gather_lst():
     use_all_images = False
     skip_existing = True  # True = skip, False = versions
     wait = 3
@@ -151,3 +151,7 @@ if __name__ == "__main__":
             tqdm.write(f"[{idx}] Skipped due to resolution failure")
 
         sleep(wait)
+
+
+if __name__ == "__main__":
+    gather_lst()
