@@ -1,5 +1,3 @@
-src/gathering/*.csv
-src/gathering/lst_responses_*.jsonl
 src/downloads/*
 
 ## Backup files

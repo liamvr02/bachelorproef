@@ -1,6 +1,7 @@
 from gather_trees import download_trees_csv
 from lst_resolve_urls import download_lst_urls
 from gather_lst import gather_lst
+from unzip_lst import unzip_lst
 
 MSG = """
 As not to overly exert the landsat data server, the script does not make use of parallelization. 
@@ -22,6 +23,11 @@ def gather_all():
     print("Preparing LST...")
     download_lst_urls()
     print("Gathering LST...")
-    gather_lst()
+    # gather_lst()
+    print("Unzipping LST...")
+    # unzip_lst()
     print("\n\nScript finished!\n")
 
+
+if __name__ == "__main__":
+    gather_all()

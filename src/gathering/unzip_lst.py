@@ -37,9 +37,13 @@ def unzip_all_zips(src_folder: str | Path, dst_folder: str | Path) -> None:
     tqdm.write("Done extracting all zip files.")
 
 
-if __name__ == "__main__":
+def unzip_lst():
     downloads_folder = Path(__file__).parent.parent.absolute() / "downloads"
     src_folder = downloads_folder / "lst_zips"
     dst_folder = downloads_folder / "lst_tifs"
 
     unzip_all_zips(src_folder, dst_folder)
+
+
+if __name__ == "__main__":
+    unzip_lst()

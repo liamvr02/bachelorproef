@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 import copy
 
 BASE_URL = "https://landsatlst.appspot.com"
-LST_RESPONSES = Path(__file__).parent.absolute() / "lst_responses.jsonl"
+LST_RESPONSES = Path(__file__).parent.parent.absolute() / "downloads" / "lst_responses.jsonl"
 
 def lst_req_resp_to_urls(req_resp: Dict[str, dict], use_all_images: bool = True) -> List[dict]:
     polygon_coords = req_resp["query"]["polygon_coords"]

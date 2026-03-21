@@ -68,7 +68,7 @@ def download_lst_urls():
 
     tqdm.write(f"Total queries generated: {len(url_dicts)}")
 
-    fp = Path(__file__).parent.absolute() / f"lst_responses_{date.today()}.jsonl"
+    fp = Path(__file__).parent.parent.absolute() / "downloads" / f"lst_responses.jsonl"
 
     resolve_lst_urls(url_dicts, fp, tsleep=1)
 
