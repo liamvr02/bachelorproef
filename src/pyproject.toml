@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datashader>=0.18.2",
+    "fastparquet>=2026.3.0",
     "osmpythontools>=0.3.6",
+    "pyarrow>=23.0.1",
     "rasterio>=1.5.0",
     "requests>=2.32.5",
     "shapely>=2.1.2",

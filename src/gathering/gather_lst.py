@@ -129,7 +129,7 @@ def gather_lst():
                 base_name = output_path.name
                 base_path = download_dir / (prefix + base_name)
 
-                # 🔁 Browser-style naming
+                # Browser-style naming
                 if not skip_existing:
                     candidate = base_path
                     counter = 1
