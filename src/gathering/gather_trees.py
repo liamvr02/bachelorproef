@@ -23,7 +23,7 @@ def download_trees_csv(url: str = CSV_URL, output_file: Path = OUTPUT_FILE):
 
 def get_trees_csv():
     if (os.path.exists(OUTPUT_FILE)):
-        print(f"{OUTPUT_FILE} already exists")
+        print(f"{OUTPUT_FILE} already exists, reading from disk...")
     else:
         download_trees_csv(CSV_URL, OUTPUT_FILE)
     

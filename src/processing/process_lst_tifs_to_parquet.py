@@ -105,8 +105,9 @@ def _parse_folder_name(folder_name: str) -> Tuple[str, str, str, str, str]:
 def _extract_timestamp_from_tif(tif_path: Path):
     name = tif_path.stem
 
-    if ".LST" in name:
-        name = name.split(".LST")[0]
+    for suffix in [".LST", ".ST_B10"]:
+        if suffix in name:
+            name = name.split(suffix)[0]
 
     if "_" in name:
         return name
@@ -117,7 +118,7 @@ def _extract_timestamp_from_tif(tif_path: Path):
 # --------------------------------------------------------------------------------------
 # Main pipeline
 # --------------------------------------------------------------------------------------
-def all_tiffs_to_parquet(keep_zero_values: bool = False) -> None:
+def all_lst_tifs_to_parquet(keep_zero_values: bool = False) -> None:
     base_dir = Path(__file__).parent.parent.absolute()
     tif_root = base_dir / "downloads" / "lst_tifs"
     output_root = base_dir / "downloads" / "lst_parquets"
@@ -185,4 +186,4 @@ def all_tiffs_to_parquet(keep_zero_values: bool = False) -> None:
 # Script entry
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    all_tiffs_to_parquet(keep_zero_values=True)
+    all_lst_tifs_to_parquet(keep_zero_values=True)

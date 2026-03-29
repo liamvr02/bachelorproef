@@ -44,6 +44,40 @@ def unzip_lst():
 
     unzip_all_zips(src_folder, dst_folder)
 
+def unzip_g3d_dwg():
+    print("Gent 3D DWG files are not superfluous due to DHM2 occupying a similar timestamp.")
+    # downloads_folder = Path(__file__).parent.parent.absolute() / "downloads"
+    # src_folder = downloads_folder / "g3d_zips"
+    # dst_folder = downloads_folder / "g3d_dwgs"
+
+    # unzip_all_zips(src_folder, dst_folder)
+
+def unzip_dhm1():
+    downloads_folder = Path(__file__).parent.parent.absolute() / "downloads"
+    src_folder = downloads_folder / "DHM1_zips"
+    dst_folder = downloads_folder / "DHM1_extracted"
+
+    unzip_all_zips(src_folder, dst_folder)
+
+def unzip_dhm2():
+    downloads_folder = Path(__file__).parent.parent.absolute() / "downloads"
+    src_folder = downloads_folder / "DHM2_zips"
+    dst_folder = downloads_folder / "DHM2_extracted"
+
+    unzip_all_zips(src_folder, dst_folder)
+
+def unzip_urban_atlas():
+    downloads_folder = Path(__file__).parent.parent.absolute() / "downloads"
+    src_folder = downloads_folder / "urban_atlas_zips"
+    dst_folder = downloads_folder / "urban_atlas_extracted"
+
+    unzip_all_zips(src_folder, dst_folder)
+
+
 
 if __name__ == "__main__":
-    unzip_lst()
+    # unzip_lst()
+    # unzip_g3d_dwg()
+    # unzip_dhm1()
+    # unzip_dhm2()
+    unzip_urban_atlas()

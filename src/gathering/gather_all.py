@@ -1,18 +1,34 @@
 from gather_trees import download_trees_csv
+from gathering.gather_g3d import gather_dwg
 from lst_resolve_urls import download_lst_urls
 from gather_lst import gather_lst
-from unzip_lst import unzip_lst
+from gathering.unzip import unzip_lst, unzip_dwg
 
-MSG = """
+CONFIRMATIONS = [
+"""
+Before running this script, please ensure the following:
+- You have a stable internet connection for the duration of the script.
+- You have sufficient disk space to store the downloaded data (potentially tens of GBs).
+- You have downloaded the DHM zips into downloads/DHM1_zips and downloads/DHM2_zips (see readme).
+
+If you have ensured all of the above, please enter 'y' to continue. [y/n]
+""",
+"""
 As not to overly exert the landsat data server, the script does not make use of parallelization. 
 Meaning this script will take a long time to collect all landsat data from 2000-2026.
 During this time, please keep the computer active and connected to the internet.
 
 This process may take up to 8 hours, are you sure you want to continue? [y/n]
 """
+]
 
 def gather_all():
-    ans = input(MSG)
+    for msg in CONFIRMATIONS:
+        ans = input(msg)
+
+        if ans not in ["y", "Y"]:
+            print("Script cancelled")
+            return
 
     if ans not in ["y", "Y"]:
         print("Script cancelled")
@@ -23,9 +39,13 @@ def gather_all():
     print("Preparing LST...")
     download_lst_urls()
     print("Gathering LST...")
-    # gather_lst()
+    gather_lst()
     print("Unzipping LST...")
-    # unzip_lst()
+    unzip_lst()
+    print("Gathering DWG...")
+    gather_dwg()
+    print("Unzipping DWG...")
+    unzip_dwg()
     print("\n\nScript finished!\n")
 
 
