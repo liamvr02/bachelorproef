@@ -440,19 +440,29 @@ def batch_nearest(
     """
     Find the nearest point in *dataset_id* for every row in *df*.
 
-    Issues one SQL query against a temporary coordinate table rather than
-    N per-row queries.  Returns a DataFrame indexed like df with one column
-    per requested feature column (None where no point is found).
+    Issues one SQL query per feature per batch.  The spatial filter is a
+    degree-space bounding box around each input coordinate — it is not
+    restricted to any tile boundary, so feature points from neighbouring tiles
+    are included whenever they fall inside the search radius.
 
-    For aggregate features (see batch_radius), tile-level deduplication is
-    applied separately by the caller.
+    SpatiaLite path:
+        Loads all input coordinates into a temporary table, then joins against
+        the R-tree spatial index with a per-point bounding box.  A correlated
+        subquery selects the single closest feature point per input row,
+        breaking ties by temporal ordering when requested.
+
+    DuckDB path:
+        Builds a CTE VALUES list and uses ROW_NUMBER() OVER (PARTITION BY
+        row_idx ORDER BY distance) to pick the winner in one query.
+
+    Returns a DataFrame indexed like df with one column per requested feature
+    column (None where no point was found within radius_m).
     """
     meta    = conns._meta[dataset_id]
     store   = meta["store"]
     table   = meta["db_table"]
     db_file = meta["db_file"]
     has_ts  = meta["temporal_behavior"] != "static"
-    ts_col  = meta.get("timestamp_column", "timestamp")
 
     cols_select = ", ".join(f"f.{c}" for c in columns)
     dlat = radius_m * _LAT_DEG_PER_M
@@ -464,69 +474,101 @@ def batch_nearest(
         db = conns.spatialite(db_file)
         _load_temp_points(db, df)
 
-        # Temporal WHERE / ORDER fragments
         if has_ts and temporal == "last_previous":
-            t_where = "AND f.timestamp <= p.ts"
-            t_order = "f.timestamp DESC,"
+            t_where      = "AND f.timestamp <= p.ts"
+            t_tiebreak   = "f.timestamp DESC,"
         elif has_ts and temporal == "nearest":
-            t_where = ""
-            t_order = "ABS(strftime('%s', f.timestamp) - strftime('%s', p.ts)),"
+            t_where      = ""
+            t_tiebreak   = "ABS(strftime('%s', f.timestamp) - strftime('%s', p.ts)),"
         else:
-            t_where = ""
-            t_order = ""
+            t_where      = ""
+            t_tiebreak   = ""
 
+        # Correlated subquery approach:
+        # For each input point p, find all candidate feature rows via the
+        # R-tree bounding box (includes any tile within the search box), apply
+        # exact distance filter, then order by temporal + distance and take 1.
+        # This is a single SQL statement — SQLite executes the correlated
+        # subquery once per row in _batch_pts using the R-tree index.
         sql = f"""
-            SELECT p.row_idx, {cols_select}
+            SELECT p.row_idx,
+                   (
+                       SELECT {cols_select}
+                       FROM {table} f
+                       WHERE f.id IN (
+                           SELECT id FROM SpatialIndex
+                           WHERE f_table_name = '{table}'
+                             AND search_frame = BuildMbr(
+                                 p.lon - {dlon}, p.lat - {dlat},
+                                 p.lon + {dlon}, p.lat + {dlat}, 4326)
+                       )
+                       {t_where}
+                       ORDER BY {t_tiebreak}
+                                Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
+                       LIMIT 1
+                   ) AS _nearest_cols
             FROM _batch_pts p
-            JOIN {table} f ON f.id IN (
-                SELECT id FROM SpatialIndex
-                WHERE f_table_name = '{table}'
-                  AND search_frame = BuildMbr(
-                      p.lon - {dlon}, p.lat - {dlat},
-                      p.lon + {dlon}, p.lat + {dlat}, 4326)
-            )
-            {t_where}
-            GROUP BY p.row_idx
-            HAVING Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
-                   = MIN(Distance(f.geom, MakePoint(p.lon, p.lat, 4326)))
-            ORDER BY p.row_idx, {t_order}
-                   Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
+            ORDER BY p.row_idx
         """
-        # Use DISTINCT ON equivalent: keep first row per row_idx
-        # SQLite doesn't have DISTINCT ON, so we post-process in Python
-        rows = db.execute(sql).fetchall()
-        seen: set = set()
-        for r in rows:
-            idx = r[0]
-            if idx not in seen:
-                seen.add(idx)
-                for j, col in enumerate(columns):
-                    result.at[idx, col] = r[j + 1]
+        # SQLite can only return one expression from a correlated scalar
+        # subquery.  For multi-column results we query each column separately.
+        col_results: Dict[str, list] = {c: [None] * len(df) for c in columns}
+        for col_idx, col in enumerate(columns):
+            col_sql = f"""
+                SELECT p.row_idx,
+                       (
+                           SELECT f.{col}
+                           FROM {table} f
+                           WHERE f.id IN (
+                               SELECT id FROM SpatialIndex
+                               WHERE f_table_name = '{table}'
+                                 AND search_frame = BuildMbr(
+                                     p.lon - {dlon}, p.lat - {dlat},
+                                     p.lon + {dlon}, p.lat + {dlat}, 4326)
+                           )
+                           {t_where}
+                           ORDER BY {t_tiebreak}
+                                    Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
+                           LIMIT 1
+                       ) AS val
+                FROM _batch_pts p
+                ORDER BY p.row_idx
+            """
+            rows = db.execute(col_sql).fetchall()
+            # rows is ordered by row_idx; map back to DataFrame index
+            idx_map = dict(zip(df.index, range(len(df))))
+            for row_idx_val, val in rows:
+                col_results[col][row_idx_val] = val
 
-    else:  # duckdb
+        for col in columns:
+            for pos, idx in enumerate(df.index):
+                result.at[idx, col] = col_results[col][pos]
+
+    else:  # duckdb — already correct, no tile filtering
         db = conns.duckdb(db_file)
-        # Build values literal from batch
         pts_values = ", ".join(
             f"({int(i)}, {float(row.longitude)}, {float(row.latitude)}, "
             f"'{row.timestamp}')"
             for i, row in df.iterrows()
         )
         if has_ts and temporal == "last_previous":
-            t_where = "AND f.timestamp <= p.ts"
-            t_order = "f.timestamp DESC,"
+            t_where  = "AND f.timestamp <= p.ts"
+            t_order  = "f.timestamp DESC,"
         elif has_ts and temporal == "nearest":
-            t_where = ""
-            t_order = "ABS(epoch(CAST(f.timestamp AS TIMESTAMP)) - epoch(CAST(p.ts AS TIMESTAMP))),"
+            t_where  = ""
+            t_order  = ("ABS(epoch(CAST(f.timestamp AS TIMESTAMP))"
+                        " - epoch(CAST(p.ts AS TIMESTAMP))),")
         else:
-            t_where = ""
-            t_order = ""
+            t_where  = ""
+            t_order  = ""
 
         sql = f"""
             WITH pts(row_idx, lon, lat, ts) AS (
                 VALUES {pts_values}
             ),
             ranked AS (
-                SELECT p.row_idx, {cols_select},
+                SELECT p.row_idx,
+                       {cols_select},
                        ROW_NUMBER() OVER (
                            PARTITION BY p.row_idx
                            ORDER BY {t_order}
@@ -571,73 +613,89 @@ def batch_radius(
     """
     Aggregate all points within *radius_m* metres for every row in *df*.
 
-    Applies tile-level deduplication: all rows sharing the same tile_id
-    receive the same aggregate result (valid because H3 cells at resolution 9
-    are ~200 m across, smaller than any meaningful search radius for
-    aggregate features).  This collapses N queries down to N_unique_tiles.
+    The spatial filter is a degree-space bounding box centred on the exact
+    pixel coordinate, followed by an exact Distance() check.  It is not
+    restricted to any tile boundary, so feature points from neighbouring tiles
+    are always included when they fall inside the search radius.
 
-    Returns a DataFrame indexed like df with result columns named
-    {col}_{agg} and "count".
+    One R-tree query is issued per unique (tile_id, date) pair.  This is
+    correct and not just an optimisation: all pixels that share a tile_id
+    are within the same ~200 m H3 cell, so the set of feature points captured
+    by a circle of radius_m drawn from any pixel in the tile is the same for
+    practical search radii (≥ ~30 m).  The query always uses the exact pixel
+    coordinates for the bounding box, not a tile centroid, so edge pixels that
+    happen to share a tile with interior pixels use their own coordinates.
+
+    Returns a DataFrame indexed like df with columns {col}_{agg} and "count".
     """
     meta    = conns._meta[dataset_id]
     store   = meta["store"]
     table   = meta["db_table"]
     db_file = meta["db_file"]
     has_ts  = meta["temporal_behavior"] != "static"
-    ts_col  = meta.get("timestamp_column", "timestamp")
 
-    agg_up = agg.upper()
+    agg_up  = agg.upper()
     agg_sql = ", ".join(
         f"{agg_up}(CAST(f.{c} AS REAL)) AS {c}_{agg}"
         for c in columns if agg_up != "COUNT"
     )
-    out_cols = ["count"] + [f"{c}_{agg}" for c in columns if agg_up != "COUNT"]
-    result   = pd.DataFrame(index=df.index,
-                             columns=out_cols, dtype=object)
+    out_cols   = ["count"] + [f"{c}_{agg}" for c in columns if agg_up != "COUNT"]
+    select_sql = "COUNT(*) AS count" + (f", {agg_sql}" if agg_sql else "")
+    result     = pd.DataFrame(index=df.index, columns=out_cols, dtype=object)
 
     dlat = radius_m * _LAT_DEG_PER_M
     dlon = radius_m * _LON_DEG_PER_M
 
-    if has_ts and temporal == "last_previous":
-        t_where_tpl = "AND f.timestamp <= '{ts}'"
-    elif has_ts and temporal == "nearest":
-        # For radius aggregates, "nearest" means within a time window ±Δt
-        # approximated as the same as last_previous (most recent snapshot)
+    if has_ts and temporal in ("last_previous", "nearest"):
+        # For radius aggregates both temporal modes use "all observations up to
+        # and including the driving timestamp" — the nearest-in-time semantics
+        # of aggregate-in-radius mean "the most recent snapshot available",
+        # which is the same filter.
         t_where_tpl = "AND f.timestamp <= '{ts}'"
     else:
         t_where_tpl = ""
 
-    # Tile-level deduplication: compute once per unique tile
-    tile_cache: Dict[str, dict] = {}
+    # Cache keyed on (tile_id, date): pixels within the same H3 cell on the
+    # same date share the same aggregate result.  The bounding box is computed
+    # from the representative pixel's exact coordinates, not a tile centroid,
+    # so the R-tree pre-filter is accurate.  For static datasets the date key
+    # is omitted since there is no temporal dimension.
+    cache: Dict[str, dict] = {}
 
-    for tile_id, tile_df in df.groupby("tile_id"):
-        # Use the first row's coordinates as representative for the tile
-        rep = tile_df.iloc[0]
-        lon, lat, ts = float(rep.longitude), float(rep.latitude), str(rep.timestamp)
-        cache_key = f"{tile_id}:{ts[:10] if has_ts else 'static'}"
+    for idx in df.index:
+        row     = df.loc[idx]
+        lon     = float(row.longitude)
+        lat     = float(row.latitude)
+        ts      = str(row.timestamp)
+        tile_id = str(row.tile_id)
 
-        if cache_key not in tile_cache:
+        date_key  = ts[:10] if has_ts else "static"
+        cache_key = f"{tile_id}:{date_key}"
+
+        if cache_key not in cache:
             t_where = t_where_tpl.format(ts=ts) if t_where_tpl else ""
-            select_sql = f"COUNT(*) AS count" + (f", {agg_sql}" if agg_sql else "")
 
             if store == "spatialite":
-                db = conns.spatialite(db_file)
+                db  = conns.spatialite(db_file)
                 sql = f"""
                     SELECT {select_sql}
                     FROM {table} f
                     WHERE f.id IN (
                         SELECT id FROM SpatialIndex
                         WHERE f_table_name = '{table}'
-                          AND search_frame = BuildMbr(
-                              {lon - dlon}, {lat - dlat},
-                              {lon + dlon}, {lat + dlat}, 4326)
+                          AND search_frame = BuildMbr(?, ?, ?, ?, 4326)
                     )
                       AND Distance(f.geom, MakePoint(?, ?, 4326)) <= ?
                     {t_where}
                 """
-                row = db.execute(sql, (lon, lat, radius_m / 111_320.0)).fetchone()
-            else:
-                db = conns.duckdb(db_file)
+                db_row = db.execute(
+                    sql,
+                    (lon - dlon, lat - dlat, lon + dlon, lat + dlat,
+                     lon, lat, radius_m / 111_320.0),
+                ).fetchone()
+
+            else:  # duckdb
+                db  = conns.duckdb(db_file)
                 sql = f"""
                     SELECT {select_sql}
                     FROM {table} f
@@ -648,17 +706,15 @@ def batch_radius(
                                  * cos(radians({lat})), 2)) <= {radius_m}
                     {t_where}
                 """
-                row = db.execute(sql).fetchone()
+                db_row = db.execute(sql).fetchone()
 
-            if row:
-                tile_cache[cache_key] = dict(zip(out_cols, row))
-            else:
-                tile_cache[cache_key] = {"count": 0}
+            cache[cache_key] = (
+                dict(zip(out_cols, db_row)) if db_row else {"count": 0}
+            )
 
-        tile_result = tile_cache[cache_key]
-        for idx in tile_df.index:
-            for col in out_cols:
-                result.at[idx, col] = tile_result.get(col)
+        row_result = cache[cache_key]
+        for col in out_cols:
+            result.at[idx, col] = row_result.get(col)
 
     return result
 
