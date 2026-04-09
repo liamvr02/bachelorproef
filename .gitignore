@@ -1,4 +1,19 @@
-src/downloads/*
+# All files in downloads
+src/downloads/**/*.*
+# TIF folders
+src/downloads/lst_tifs/*
+
+src/downloads/DHM[1,2]_extracted/*
+
+# MLflow runs
+**/mlruns
+
+src/**/*.csv
+src/prepared_stream_data/*
+
+**/__pycache__
+
+
 .venv
 
 ## Backup files

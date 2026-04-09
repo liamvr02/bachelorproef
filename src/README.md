@@ -5,6 +5,11 @@ Any commands in this readme should be run from the /src/ folder unless stated ot
 
 ## Installation
 
+install sqlite and spatialite, there's many ways to do this but it is recommended to use either:
+
+- conda (with ´--channel conda-forge´)
+- OSGeo4W (GUI)
+
 install [astral uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ```bash

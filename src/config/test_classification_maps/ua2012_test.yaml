@@ -1,0 +1,18 @@
+distance_targets:
+- urban_fabric
+- green_urban
+mappings:
+  green_urban:
+  - arable_land
+  - herbaceous_vegetation
+  - forests
+  - herbaceous_wetland
+  low_density_urban:
+  - herbaceous_vegetation_association
+  - complex_and_mixed_cultivation_patterns
+  urban_fabric:
+  - urban_fabric
+  - industrial_commercial_public_military_private_and_transport_units
+  - airport
+ua_dataset: urban_atlas_2012
+version: '1.0'
