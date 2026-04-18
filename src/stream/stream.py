@@ -17,6 +17,7 @@ Quick start
     # Register features from the built-in framework
     reg = FeatureRegistry()
     reg.add(nearest("dhm1",        columns=["elevation"],  temporal="last_previous"))
+    reg.add(nearest("ndvi",        columns=["ndvi"],       temporal="nearest"))
     reg.add(aggregate_in_radius("trees", radius_m=50,      columns=["height_m"],
                                  agg="count",              temporal="none"))
 
@@ -47,7 +48,7 @@ Quick start
 Architecture
 ------------
 LST rows are read from lst.duckdb with DuckDB cursor.fetchmany() so the
-hundreds-of-million-row table is never loaded into memory.
+725 M-row table is never loaded into memory.
 
 Feature computation uses two paths:
 
@@ -110,7 +111,10 @@ from features import (
     nearest, aggregate_in_radius,
     urban_atlas_luc_fraction, wis_fraction,
 )
-from geo import DEFAULT_PREPARED, _LAT_DEG_PER_M, _LON_DEG_PER_M
+from geo import (
+    DEFAULT_PREPARED, _LAT_DEG_PER_M, _LON_DEG_PER_M,
+    GHENT_LON_MIN, GHENT_LON_MAX, GHENT_LAT_MIN, GHENT_LAT_MAX,
+)
 from logging_config import configure_logging
 from poly_raster import (
     _PolyRaster,
@@ -375,30 +379,38 @@ class StreamConfig:
     def _build_poly_rasters(
         self,
         registry: "FeatureRegistry",
-        lst_conn: duckdb.DuckDBPyConnection,
-        partitions: List[Tuple[str, float]],
     ) -> Optional["_PolyRaster"]:
         """
         Precompute polygon-fraction features (Urban Atlas, WIS) onto a regular
         lon/lat grid and wire the result into every registered descriptor that
         carries a _raster_ref.
 
+        The raster is built **once per stream() call**, independently of which
+        LST partitions were selected.  It always covers the full Ghent spatial
+        extent (GHENT_LON/LAT_MIN/MAX from geo.py) so that the precomputed
+        grid is valid for any combination of partitions without rebuilding.
+
         Algorithm
         ---------
-        1.  Query the bounding box of all selected partitions from the LST
-            table (MIN/MAX longitude and latitude in one DuckDB pass — fast
-            thanks to zone-map pruning on the sorted columns).
+        1.  Use the fixed Ghent bounding box as the raster extent.  This
+            decouples raster build cost from partition selection: a run that
+            streams only summer months gets the same raster as a full run,
+            and no LST table scan is needed to determine the extent.
 
         2.  Construct a _PolyRaster grid at self.raster_resolution_m spacing,
             with a 1-cell border pad to avoid edge effects when LST pixels
             land on the boundary.
 
-        3.  For each unique (luc_code/attr_val, radius_m, ua_year) combination
-            found in the registered descriptors, iterate every grid point and
-            call the exact same _ua_fetch_candidates + _ua_compute_fraction
-            pipeline used by the live batch path.  This guarantees correctness:
-            the precomputed value is identical to what the live path would
-            return for a query issued from that coordinate.
+        3.  For each unique (luc_code, radius_m, ua_year) / (attr_col,
+            attr_val, radius_m) combination found in the registered
+            descriptors, rasterise the SpatiaLite polygons onto the grid.
+            UA descriptors with ua_year=None expand to **all four survey
+            years** (2006, 2012, 2018, 2021); at query time lookup_ua_
+            last_previous() selects the appropriate year per LST row.
+            Duplicate (luc_code, radius_m, year) triples produced by
+            multiple descriptors that share a luc_code/radius are de-
+            duplicated before rasterisation — each unique layer is computed
+            exactly once.
 
         4.  Attach the completed raster to each descriptor's _raster_ref cell.
 
@@ -417,28 +429,15 @@ class StreamConfig:
             log.info("raster: no raster-capable descriptors registered — skipping")
             return None
 
-        # ---- Step 1: bounding box of selected partitions ----
-        pk_list = ", ".join(f"'{pk}'" for pk in [p[0] for p in partitions])
-        t0 = time.perf_counter()
-        row = lst_conn.execute(f"""
-            SELECT
-                MIN(longitude) AS lon_min,
-                MAX(longitude) AS lon_max,
-                MIN(latitude)  AS lat_min,
-                MAX(latitude)  AS lat_max
-            FROM lst
-            WHERE partition_key IN ({pk_list})
-        """).fetchone()
-        if row is None or row[0] is None:
-            log.warning("raster: could not determine LST bounding box — skipping precomputation")
-            return None
-
-        lon_min, lon_max, lat_min, lat_max = row
+        # ---- Step 1: use the fixed Ghent spatial extent ----
+        # We deliberately do NOT query the LST table here.  The raster must
+        # cover the full city regardless of which partitions (months/years)
+        # are selected for this particular stream() run.
+        lon_min, lon_max = GHENT_LON_MIN, GHENT_LON_MAX
+        lat_min, lat_max = GHENT_LAT_MIN, GHENT_LAT_MAX
         log.info(
-            "raster: LST bbox lon=[%.4f, %.4f] lat=[%.4f, %.4f] "
-            "(%.3fs, %d partitions)",
+            "raster: using fixed Ghent bbox lon=[%.4f, %.4f] lat=[%.4f, %.4f]",
             lon_min, lon_max, lat_min, lat_max,
-            time.perf_counter() - t0, len(partitions),
         )
 
         # ---- Step 2: build grid ----
@@ -460,17 +459,56 @@ class StreamConfig:
         )
         raster.log_summary()
 
-        # ---- Step 3: identify unique (spec) combinations ----
-        ua_specs:  Dict[Tuple, List] = {}
+        # ---- Step 3: identify unique layer specs ----
+        # Use sets/dicts so that multiple descriptors sharing the same
+        # (luc_code, radius_m) or (attr_col, attr_val, radius_m) don't
+        # cause redundant rasterisation passes.
+        #
+        # UA: key=(luc_code, radius_m) → set of concrete ua_years to compute.
+        #   ua_year=None  → expand to all four survey years so that
+        #                   lookup_ua_last_previous() works at query time.
+        #   ua_year=<int> → add only that year.
+        #
+        # Both "ua" (single-code) and "ua_classifications" (multi-code)
+        # descriptors contribute their LUC codes to the same dict so that
+        # each unique (luc_code, radius_m, year) triple is rasterised
+        # exactly once and shared across all descriptors that need it.
+        ua_years_to_compute: Dict[Tuple[str, float], set] = {}
+
         wis_specs: Dict[Tuple, List] = {}
+
+        def _register_ua_luc(luc_code: str, radius_m: float, ua_year) -> None:
+            key = (luc_code, radius_m)
+            if key not in ua_years_to_compute:
+                ua_years_to_compute[key] = set()
+            if ua_year is None:
+                ua_years_to_compute[key].update(_PolyRaster.UA_YEARS)
+            else:
+                ua_years_to_compute[key].add(ua_year)
 
         for desc in raster_descs:
             if desc._raster_type == "ua":
-                key = (desc._luc_code, desc._radius_m, desc._ua_year)
-                ua_specs.setdefault(key, []).append(desc)
+                _register_ua_luc(desc._luc_code, desc._radius_m, desc._ua_year)
+            elif desc._raster_type == "ua_classifications":
+                for luc_codes in desc._classification_map.values():
+                    for luc_code in luc_codes:
+                        _register_ua_luc(luc_code, desc._radius_m, desc._ua_year)
             elif desc._raster_type == "wis":
                 key = (desc._attr_col, desc._attr_val, desc._radius_m)
                 wis_specs.setdefault(key, []).append(desc)
+
+        # Flatten to ordered lists for the rasterisation loop
+        ua_layer_list: List[Tuple[str, float, int]] = []
+        for (luc_code, radius_m), years in ua_years_to_compute.items():
+            for y in sorted(years):          # deterministic order
+                ua_layer_list.append((luc_code, radius_m, y))
+
+        wis_layer_list = [(ac, av, rm) for (ac, av, rm) in wis_specs]
+
+        all_layers = (
+            [("ua", x) for x in ua_layer_list] +
+            [("wis", x) for x in wis_layer_list]
+        )
 
         # Open SpatiaLite for polygon fetching
         db = sqlite3.connect(str(self.prepared / "spatial.db"))
@@ -484,35 +522,14 @@ class StreamConfig:
             except sqlite3.OperationalError:
                 continue
 
-        total_specs   = len(ua_specs) + len(wis_specs)
-        total_cells   = n_lon * n_lat
+        total_cells    = n_lon * n_lat
         t_raster_start = time.perf_counter()
 
         log.info(
-            "raster: precomputing %d UA spec(s) + %d WIS spec(s) "
+            "raster: precomputing %d UA layer(s) + %d WIS layer(s) "
             "over %d x %d = %d grid cells at %.0f m resolution",
-            len(ua_specs), len(wis_specs), n_lon, n_lat, total_cells, res_m,
-        )
-
-        # ---- UA layers ----
-        ua_years_to_compute: Dict[Tuple[str, float], List[Optional[int]]] = {}
-        for (luc_code, radius_m, ua_year), _ in ua_specs.items():
-            if ua_year is None:
-                years = list(_PolyRaster.UA_YEARS)
-            else:
-                years = [ua_year]
-            ua_years_to_compute[(luc_code, radius_m)] = years
-
-        ua_layer_list = []
-        for (luc_code, radius_m), years in ua_years_to_compute.items():
-            for y in years:
-                ua_layer_list.append((luc_code, radius_m, y))
-
-        wis_layer_list = [(ac, av, rm) for (ac, av, rm) in wis_specs]
-
-        all_layers = (
-            [("ua", x) for x in ua_layer_list] +
-            [("wis", x) for x in wis_layer_list]
+            len(ua_layer_list), len(wis_layer_list),
+            n_lon, n_lat, total_cells, res_m,
         )
 
         with tqdm(total=len(all_layers), desc="Raster precompute",
@@ -892,7 +909,7 @@ class StreamConfig:
 
         # ---- Precompute polygon rasters (UA + WIS) before the batch loop ----
         if registry is not None:
-            self._build_poly_rasters(registry, lst_conn, partitions)
+            self._build_poly_rasters(registry)
 
         has_batch = len(registry._batch_descriptors) > 0
         has_row   = len(registry._row_descriptors)   > 0

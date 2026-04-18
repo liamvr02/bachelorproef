@@ -46,6 +46,17 @@ DEFAULT_PREPARED = _SRC / "prepared_stream_data"
 _LAT_DEG_PER_M  = 1.0 / 111_320.0
 _LON_DEG_PER_M  = 1.0 / (111_320.0 * math.cos(math.radians(51.0)))
 
+# Spatial extent of the city of Ghent (WGS-84).
+# Derived from the OSM relation boundary polygon; used as a stable, partition-
+# independent bounding box for the polygon-fraction raster precomputation so
+# the raster covers the full study area regardless of which LST partitions are
+# selected for a given stream run.
+# Source: ghent_polygon.py / shapely.geometry.Polygon.bounds on the OSM outer ring.
+GHENT_LON_MIN = 3.57
+GHENT_LON_MAX = 3.86
+GHENT_LAT_MIN = 50.96
+GHENT_LAT_MAX = 51.21
+
 
 # ---------------------------------------------------------------------------
 # Temporal helpers

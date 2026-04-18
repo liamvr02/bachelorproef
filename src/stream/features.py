@@ -78,10 +78,12 @@ class _FeatureDescriptor:
     """
     __slots__ = (
         "name", "prefix", "_batch_fn", "_row_fn",
-        # Raster precomputation spec — set by urban_atlas_luc_fraction()
-        # and wis_fraction() factories; absent on all other descriptors.
+        # Raster precomputation spec — set by urban_atlas_luc_fraction(),
+        # urban_atlas_classifications_fractions(), and wis_fraction() factories;
+        # absent on all other descriptors.
         "_raster_ref", "_raster_type",
-        "_luc_code", "_ua_year",           # UA fields
+        "_luc_code", "_ua_year",           # UA single-code fields
+        "_classification_map",             # UA multi-code (classifications) field
         "_attr_col", "_attr_val",          # WIS fields
         "_radius_m",                       # shared
     )
@@ -433,15 +435,28 @@ def urban_atlas_classifications_fractions(
     {prefix}{classification}_{radius_m}m_frac for each classification
     Each column is a float in [0.0, 1.0] representing the fraction of the
     circle's area covered by that classification.
+
+    Performance
+    -----------
+    When StreamConfig is initialised with raster_resolution_m > 0 (default
+    15 m), a _PolyRaster is precomputed at stream() start for every LUC code
+    in the classification_map.  All batch lookups then cost O(1) per row
+    (numpy array index) and require no SpatiaLite round-trips.  The slow
+    Shapely path is the fallback if no raster is available.
     """
     if not isinstance(classification_map, dict):
         raise TypeError("classification_map must be a dict")
     
+    # Normalise all LUC codes to strings once at factory time
+    norm_map: Dict[str, List[str]] = {
+        cls: [str(c) for c in codes]
+        for cls, codes in classification_map.items()
+    }
+
     # Validate: each LUC code appears in at most one classification
     reverse_map: Dict[str, str] = {}
-    for classification, luc_codes in classification_map.items():
-        for luc_code in luc_codes:
-            luc_code_str = str(luc_code)
+    for classification, luc_codes in norm_map.items():
+        for luc_code_str in luc_codes:
             if luc_code_str in reverse_map:
                 raise ValueError(
                     f"LUC code '{luc_code_str}' appears in multiple classifications"
@@ -449,43 +464,72 @@ def urban_atlas_classifications_fractions(
             reverse_map[luc_code_str] = classification
     
     _prefix = prefix or "ua_"
-    
+
+    # _raster_ref is a mutable cell wired by _build_poly_rasters before the
+    # first batch.  When populated, batch lookups cost O(1) per row.
+    _raster_ref: List[Optional[_PolyRaster]] = [None]
+
     def _batch(df: pd.DataFrame, conns: Connections) -> pd.DataFrame:
+        raster = _raster_ref[0]
         result_cols: Dict[str, any] = {}
-        
-        for classification, luc_codes in classification_map.items():
-            # Sum fractions across all codes in this classification
-            total_frac = np.zeros(len(df), dtype=np.float32)
-            
+
+        lons = df["longitude"].to_numpy(dtype=float)
+        lats = df["latitude"].to_numpy(dtype=float)
+        tss  = df["timestamp"].to_numpy(dtype=str)
+        n    = len(df)
+
+        for classification, luc_codes in norm_map.items():
+            total_frac = np.zeros(n, dtype=np.float32)
+
             for luc_code in luc_codes:
-                frac_col = f"luc{luc_code}_{int(radius_m)}m_frac"
-                
-                # Fetch individual LUC code fractions using existing framework
-                batch = batch_urban_atlas_luc_fraction(
-                    df, conns, str(luc_code), radius_m, ua_year,
-                    frac_col, raster=None
-                )
-                
-                if frac_col in batch.columns:
-                    total_frac += batch[frac_col].to_numpy()
-            
-            # Cap aggregate at 1.0 (overlapping coverage)
+                if raster is not None:
+                    # Fast path: O(1) raster lookup per row
+                    if ua_year is not None:
+                        layer_key = f"{luc_code}:{ua_year}"
+                        code_frac = np.array(
+                            [raster.lookup(lons[i], lats[i], layer_key) or 0.0
+                             for i in range(n)],
+                            dtype=np.float32,
+                        )
+                    else:
+                        code_frac = np.array(
+                            [raster.lookup_ua_last_previous(
+                                 lons[i], lats[i], luc_code, int(tss[i][:4])) or 0.0
+                             for i in range(n)],
+                            dtype=np.float32,
+                        )
+                else:
+                    # Slow path: per-tile SpatiaLite + Shapely queries
+                    frac_col = f"luc{luc_code}_{int(radius_m)}m_frac"
+                    batch = batch_urban_atlas_luc_fraction(
+                        df, conns, luc_code, radius_m, ua_year,
+                        frac_col, raster=None,
+                    )
+                    code_frac = (
+                        batch[frac_col].to_numpy(dtype=np.float32)
+                        if frac_col in batch.columns
+                        else np.zeros(n, dtype=np.float32)
+                    )
+
+                total_frac += code_frac
+
+            # Cap aggregate at 1.0 (polygons of different codes may overlap)
             total_frac = np.minimum(total_frac, 1.0)
             col_name = f"{_prefix}{classification}_{int(radius_m)}m_frac"
             result_cols[col_name] = total_frac
-        
+
         return pd.DataFrame(result_cols, index=df.index)
     
     def _row(row: FeatureRow, conns: Connections) -> dict:
         result = {}
         
-        for classification, luc_codes in classification_map.items():
+        for classification, luc_codes in norm_map.items():
             total_frac = 0.0
             
             for luc_code in luc_codes:
                 frac = query_urban_atlas_luc_fraction(
                     conns, row.longitude, row.latitude,
-                    radius_m=radius_m, luc_code=str(luc_code), ua_year=ua_year,
+                    radius_m=radius_m, luc_code=luc_code, ua_year=ua_year,
                 )
                 if frac is not None:
                     total_frac += frac
@@ -503,7 +547,11 @@ def urban_atlas_classifications_fractions(
         batch_fn=_batch,
         row_fn=_row,
     )
-    
+    desc._raster_ref        = _raster_ref
+    desc._raster_type       = "ua_classifications"
+    desc._classification_map = norm_map
+    desc._radius_m          = radius_m
+    desc._ua_year           = ua_year
     return desc
 
 
