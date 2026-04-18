@@ -86,6 +86,7 @@ Temporal (applies to non-static datasets):
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import sqlite3
@@ -229,6 +230,10 @@ class StreamConfig:
         self._catalog_meta: Optional[dict] = None
         self._bin_edges_dict: Dict[str, List[float]] = {}  # temperature, timestamp, longitude, latitude
         self._partition_stats: Optional[List[dict]] = None
+        # Raster cache lives two levels above stream.py: /src/stream_cache/rasters/
+        self._raster_cache_dir: Path = (
+            Path(__file__).resolve().parent.parent / "stream_cache" / "rasters"
+        )
 
     def set_distribution(self, target: Dict) -> "StreamConfig":
         """
@@ -376,6 +381,126 @@ class StreamConfig:
         self._catalog_conn = conn
         log.info("catalog: total load time %.3fs", time.perf_counter() - t0)
 
+    # ------------------------------------------------------------------
+    # Raster cache helpers
+    # ------------------------------------------------------------------
+
+    def _raster_cache_key(
+        self,
+        ua_layer_list:  List[Tuple[str, float, int]],
+        wis_layer_list: List[Tuple[str, str, float]],
+        lon_min: float, lon_max: float,
+        lat_min: float, lat_max: float,
+    ) -> str:
+        """
+        Build a deterministic SHA-256 hex digest that uniquely identifies a
+        raster configuration.
+
+        The digest is computed over a canonical JSON document containing:
+          - grid parameters (resolution, bbox, derived step/origin/shape)
+          - an alphabetically sorted list of every layer spec
+
+        Two rasters are considered identical iff their digest matches, meaning
+        the same layers will be present with the same grid geometry.  If the
+        user changes resolution, bbox, or any registered feature's luc_code /
+        radius / year, the digest changes and a fresh raster is built.
+
+        Returns a 16-character prefix of the full hex digest — long enough to
+        be collision-free in practice while keeping filenames readable.
+        """
+        res_m    = self.raster_resolution_m
+        step_lon = res_m * _LON_DEG_PER_M
+        step_lat = res_m * _LAT_DEG_PER_M
+        pad      = 1
+        lon0     = lon_min - pad * step_lon
+        lat0     = lat_min - pad * step_lat
+        n_lon    = int(math.ceil((lon_max - lon_min) / step_lon)) + 2 * pad + 1
+        n_lat    = int(math.ceil((lat_max - lat_min) / step_lat)) + 2 * pad + 1
+
+        spec = {
+            "resolution_m": res_m,
+            "lon0":         round(lon0,    10),
+            "lat0":         round(lat0,    10),
+            "step_lon":     round(step_lon, 10),
+            "step_lat":     round(step_lat, 10),
+            "n_lon":        n_lon,
+            "n_lat":        n_lat,
+            # Sort layer specs so descriptor registration order doesn't matter
+            "ua_layers": sorted(
+                [{"luc_code": lc, "radius_m": r, "ua_year": y}
+                 for lc, r, y in ua_layer_list],
+                key=lambda d: (d["luc_code"], d["radius_m"], d["ua_year"]),
+            ),
+            "wis_layers": sorted(
+                [{"attr_col": ac, "attr_val": av, "radius_m": r}
+                 for ac, av, r in wis_layer_list],
+                key=lambda d: (d["attr_col"], d["attr_val"], d["radius_m"]),
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(spec, sort_keys=True).encode()
+        ).hexdigest()
+        return digest[:16]
+
+    def _load_cached_raster(self, cache_key: str) -> Optional["_PolyRaster"]:
+        """
+        Try to load a previously saved raster from disk.
+
+        Returns the _PolyRaster on success, None on any miss or error
+        (missing file, corrupt archive, schema mismatch).  Errors are logged
+        as warnings so a corrupt cache degrades gracefully to a rebuild.
+        """
+        json_path = self._raster_cache_dir / f"{cache_key}.json"
+        npz_path  = self._raster_cache_dir / f"{cache_key}.npz"
+
+        if not json_path.exists() or not npz_path.exists():
+            log.info("raster cache: no entry for key %s", cache_key)
+            return None
+
+        log.info("raster cache: found entry %s — loading ...", cache_key)
+        t0 = time.perf_counter()
+        try:
+            raster = _PolyRaster.load(npz_path, json_path)
+            log.info(
+                "raster cache: loaded %d layer(s) in %.1fs  [key=%s]",
+                len(raster._layers), time.perf_counter() - t0, cache_key,
+            )
+            return raster
+        except Exception as exc:
+            log.warning(
+                "raster cache: load failed for key %s (%s) — will recompute",
+                cache_key, exc,
+            )
+            return None
+
+    def _save_raster_cache(self, raster: "_PolyRaster", cache_key: str) -> None:
+        """
+        Persist a freshly computed raster to the cache directory.
+
+        Failures are logged as warnings and do not abort the stream — the
+        raster is still used in-memory for this run; only the next run would
+        miss the cache.
+        """
+        json_path = self._raster_cache_dir / f"{cache_key}.json"
+        npz_path  = self._raster_cache_dir / f"{cache_key}.npz"
+        log.info(
+            "raster cache: saving %d layer(s) → %s  [key=%s]",
+            len(raster._layers), self._raster_cache_dir, cache_key,
+        )
+        t0 = time.perf_counter()
+        try:
+            raster.save(npz_path, json_path)
+            log.info(
+                "raster cache: saved in %.1fs  [key=%s]",
+                time.perf_counter() - t0, cache_key,
+            )
+        except Exception as exc:
+            log.warning(
+                "raster cache: save failed for key %s (%s) — "
+                "cache will be empty for the next run",
+                cache_key, exc,
+            )
+
     def _build_poly_rasters(
         self,
         registry: "FeatureRegistry",
@@ -510,6 +635,39 @@ class StreamConfig:
             [("wis", x) for x in wis_layer_list]
         )
 
+        # ---- Step 4: check the on-disk cache ----
+        cache_key = self._raster_cache_key(
+            ua_layer_list, wis_layer_list,
+            lon_min, lon_max, lat_min, lat_max,
+        )
+        log.info("raster cache: key=%s", cache_key)
+
+        cached = self._load_cached_raster(cache_key)
+        if cached is not None:
+            # Verify every expected layer is present (guards against a cache
+            # written by an older version that had fewer layers)
+            expected = {f"{lc}:{y}" for lc, _, y in ua_layer_list}
+            expected |= {f"wis:{av}" for _, av, _ in wis_layer_list}
+            missing  = expected - set(cached._layers.keys())
+            if missing:
+                log.warning(
+                    "raster cache: hit for key %s but %d layer(s) missing %s "
+                    "— discarding and recomputing",
+                    cache_key, len(missing), sorted(missing),
+                )
+            else:
+                log.info(
+                    "raster cache: HIT — skipping precomputation "
+                    "(%d layers, key=%s)",
+                    len(cached._layers), cache_key,
+                )
+                cached.log_summary()
+                for desc in raster_descs:
+                    desc._raster_ref[0] = cached
+                    log.debug("raster: wired cached raster into descriptor '%s'", desc.name)
+                return cached
+
+        # ---- Step 5: open SpatiaLite and rasterise ----
         # Open SpatiaLite for polygon fetching
         db = sqlite3.connect(str(self.prepared / "spatial.db"))
         db.enable_load_extension(True)
@@ -609,7 +767,10 @@ class StreamConfig:
         )
         raster.log_summary()
 
-        # ---- Step 4: wire raster into all descriptor _raster_ref cells ----
+        # ---- Step 6: persist to cache so the next run skips precomputation ----
+        self._save_raster_cache(raster, cache_key)
+
+        # ---- Step 7: wire raster into all descriptor _raster_ref cells ----
         for desc in raster_descs:
             desc._raster_ref[0] = raster
             log.debug("raster: wired into descriptor '%s'", desc.name)

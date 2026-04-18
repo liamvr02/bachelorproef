@@ -470,6 +470,107 @@ class _PolyRaster:
         return self.lookup(lon, lat, f"wis:{attr_val}")
 
     # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def save(self, npz_path: "Path", json_path: "Path") -> None:
+        """
+        Persist the raster to disk.
+
+        Two files are written atomically (write-to-temp then rename):
+          npz_path  — numpy .npz archive, one array per layer key.
+                      Layer keys contain colons (e.g. "11100:2006") which
+                      numpy replaces with "__COLON__" in array names to stay
+                      compatible with the npz format; load() reverses this.
+          json_path — sidecar with grid parameters and coverage counts.
+                      Used by StreamConfig to validate a cache hit before
+                      loading the heavy arrays.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        npz_path  = _Path(npz_path)
+        json_path = _Path(json_path)
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # --- npz: rename layer keys so numpy doesn't choke on colons ---
+        arrays = {
+            k.replace(":", "__COLON__"): v
+            for k, v in self._layers.items()
+        }
+
+        # Write to a temp file then rename so a crash can't leave a partial file.
+        # np.savez_compressed always appends ".npz" to whatever path it receives,
+        # so we must NOT pass a path that already ends in ".npz".
+        # Strategy: write to "<dir>/.tmp_<stem>" and let numpy produce
+        # "<dir>/.tmp_<stem>.npz", then rename that to the final path.
+        tmp_stem = npz_path.parent / f".tmp_{npz_path.stem}"
+        tmp_json = json_path.parent / f".tmp_{json_path.name}"
+
+        np.savez_compressed(str(tmp_stem), **arrays)
+        tmp_written = tmp_stem.with_suffix(".npz")  # what numpy actually created
+        tmp_written.replace(npz_path)
+
+        meta = {
+            "lon0":         self.lon0,
+            "lat0":         self.lat0,
+            "step_lon":     self.step_lon,
+            "step_lat":     self.step_lat,
+            "n_lon":        self.n_lon,
+            "n_lat":        self.n_lat,
+            "resolution_m": self.resolution_m,
+            "layer_keys":   sorted(self._layers.keys()),
+            "coverage":     self._coverage,
+        }
+        tmp_json.write_text(_json.dumps(meta, indent=2))
+        tmp_json.replace(json_path)
+
+    @classmethod
+    def load(cls, npz_path: "Path", json_path: "Path") -> "_PolyRaster":
+        """
+        Restore a _PolyRaster from the files written by save().
+
+        Raises FileNotFoundError if either file is missing.
+        Raises ValueError if the npz archive is corrupt or keys don't match
+        the sidecar — caller should treat this as a cache miss.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        npz_path  = _Path(npz_path)
+        json_path = _Path(json_path)
+
+        meta = _json.loads(json_path.read_text())
+        raster = cls(
+            lon0         = meta["lon0"],
+            lat0         = meta["lat0"],
+            step_lon     = meta["step_lon"],
+            step_lat     = meta["step_lat"],
+            n_lon        = meta["n_lon"],
+            n_lat        = meta["n_lat"],
+            resolution_m = meta["resolution_m"],
+        )
+
+        archive = np.load(str(npz_path))
+        expected_keys = set(meta["layer_keys"])
+        loaded_keys   = set()
+
+        for npz_key in archive.files:
+            layer_key = npz_key.replace("__COLON__", ":")
+            if layer_key not in expected_keys:
+                raise ValueError(
+                    f"Unexpected layer '{layer_key}' in npz — cache may be corrupt"
+                )
+            raster._layers[layer_key] = archive[npz_key].astype(np.float32)
+            loaded_keys.add(layer_key)
+
+        missing = expected_keys - loaded_keys
+        if missing:
+            raise ValueError(f"Cache npz missing layers: {missing}")
+
+        raster._coverage = {k: int(v) for k, v in meta["coverage"].items()}
+        return raster
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     def log_summary(self) -> None:
