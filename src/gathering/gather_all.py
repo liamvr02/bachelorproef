@@ -2,7 +2,8 @@ from gather_trees import download_trees_csv
 from gathering.gather_g3d import gather_dwg
 from lst_resolve_urls import download_lst_urls
 from gather_lst import gather_lst
-from gathering.unzip import unzip_lst, unzip_dwg
+from gather_wis import gather_wis
+from unzip import unzip_lst, unzip_dwg
 
 CONFIRMATIONS = [
 """
@@ -46,6 +47,8 @@ def gather_all():
     gather_dwg()
     print("Unzipping DWG...")
     unzip_dwg()
+    print("Gathering WIS data...")
+    gather_wis()
     print("\n\nScript finished!\n")
 
 

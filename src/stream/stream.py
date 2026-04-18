@@ -1,11 +1,12 @@
 """
-stream.py  —  /src/stream/stream.py
+stream.py  -  /src/stream/stream.py
 ====================================
 Spatiotemporal LST streaming layer.
 
 Quick start
 -----------
     from stream import StreamConfig, FeatureRegistry, nearest, aggregate_in_radius
+    from stream import urban_atlas_luc_fraction
     from pathlib import Path
 
     cfg = StreamConfig(prepared_data=Path("prepared_stream_data"))
@@ -16,18 +17,24 @@ Quick start
     # Register features from the built-in framework
     reg = FeatureRegistry()
     reg.add(nearest("dhm1",        columns=["elevation"],  temporal="last_previous"))
-    reg.add(nearest("ndvi",        columns=["ndvi"],       temporal="nearest"))
     reg.add(aggregate_in_radius("trees", radius_m=50,      columns=["height_m"],
                                  agg="count",              temporal="none"))
 
+    # Urban Atlas land-use fraction within a radius
+    reg.add(urban_atlas_luc_fraction("11100", radius_m=100))  # continuous urban fabric
+    reg.add(urban_atlas_luc_fraction("14100", radius_m=100))  # green urban areas
+
     # Custom feature using framework building-blocks (row-level API)
-    from stream import query_nearest, query_radius
+    from stream import query_nearest, query_urban_atlas_luc_fraction
     def my_feature(row, connections):
         elev = query_nearest(connections, "dhm2", row.longitude, row.latitude,
                              row.timestamp, columns=["elevation"],
                              temporal="last_previous")
-        return {"dhm2_elev_log": math.log1p(elev.get("elevation", 0))}
-    reg.add_custom(my_feature, name="dhm2_log_elevation")
+        frac = query_urban_atlas_luc_fraction(connections, row.longitude, row.latitude,
+                                              radius_m=200, luc_code="11100")
+        return {"dhm2_elev_log": math.log1p(elev.get("elevation", 0)),
+                "urban_frac_200m": frac}
+    reg.add_custom(my_feature, name="custom_urban_elev")
 
     # Capture as DataFrame
     import pandas as pd
@@ -40,11 +47,12 @@ Quick start
 Architecture
 ------------
 LST rows are read from lst.duckdb with DuckDB cursor.fetchmany() so the
-725 M-row table is never loaded into memory.
+hundreds-of-million-row table is never loaded into memory.
 
 Feature computation uses two paths:
 
-BATCH path (framework features — nearest, aggregate_in_radius):
+BATCH path (framework features - nearest, aggregate_in_radius,
+            urban_atlas_luc_fraction):
   Each batch's coordinates are bulk-loaded into a SpatiaLite temporary table.
   A single spatial JOIN per feature replaces N per-row queries.
   For aggregate features, results are deduplicated by tile_id so rows sharing
@@ -53,35 +61,37 @@ BATCH path (framework features — nearest, aggregate_in_radius):
 
 ROW path (custom callables added via add_custom):
   Custom features receive one FeatureRow at a time plus a Connections object.
-  They may call query_nearest() and query_radius() to reuse framework logic.
+  They may call query_nearest(), query_radius(), and
+  query_urban_atlas_luc_fraction() to reuse framework logic.
   Results are accumulated into pre-allocated column arrays (not list-of-dicts)
   and assembled into a DataFrame at batch end.
 
-The 2×2 temporal×spatial framework
+The 2x2 temporalxspatial framework
 -----------------------------------
 Spatial:
   nearest(dataset, columns, temporal, ...)
-      → the single closest point in space (optionally filtered by time)
+      -> the single closest point in space (optionally filtered by time)
   aggregate_in_radius(dataset, radius_m, columns, agg, temporal, ...)
-      → COUNT / AVG / SUM / MIN / MAX of all points within radius_m metres
+      -> COUNT / AVG / SUM / MIN / MAX of all points within radius_m metres
+  urban_atlas_luc_fraction(luc_code, radius_m, ua_year, ...)
+      -> fraction [0, 1] of a circle's area occupied by polygons of luc_code
 
 Temporal (applies to non-static datasets):
-  "last_previous"   → most recent observation with ts <= driving_ts
-  "nearest"         → observation with smallest |ts - driving_ts|
-  "none"            → no temporal filter (static datasets)
+  "last_previous"   -> most recent observation with ts <= driving_ts
+  "nearest"         -> observation with smallest |ts - driving_ts|
+  "none"            -> no temporal filter (static datasets)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
-import threading
-from collections import namedtuple
+import time
 from pathlib import Path
 from typing import (
-    Callable, Dict, Generator, Iterable, Iterator,
-    List, Optional, Sequence, Tuple
+    Dict, Generator, List, Optional, Tuple
 )
 
 import duckdb
@@ -89,888 +99,36 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-
 # ---------------------------------------------------------------------------
-# Paths
+# Sub-module imports
 # ---------------------------------------------------------------------------
-_HERE = Path(__file__).resolve().parent        # /src/stream/
-_SRC  = _HERE.parent                           # /src/
-DEFAULT_PREPARED = _SRC / "prepared_stream_data"
-
-# Degrees per metre at Belgian latitudes (~51 °N).
-# Used to convert radius_m to a rough degree bounding box for the R-tree
-# pre-filter before the exact Distance() check.
-_LAT_DEG_PER_M  = 1.0 / 111_320.0
-_LON_DEG_PER_M  = 1.0 / (111_320.0 * math.cos(math.radians(51.0)))
-
-
-# ---------------------------------------------------------------------------
-# FeatureRow — typed view of one LST row passed to feature callables
-# ---------------------------------------------------------------------------
-FeatureRow = namedtuple(
-    "FeatureRow",
-    ["longitude", "latitude", "temperature", "emissivity",
-     "landsat_id", "image_id", "timestamp", "partition_key", "tile_id"],
+from connections import Connections
+from distribution import DistributionTarget
+from features import (
+    FeatureRow, FeatureRegistry,
+    _FeatureDescriptor,
+    nearest, aggregate_in_radius,
+    urban_atlas_luc_fraction, wis_fraction,
+)
+from geo import DEFAULT_PREPARED, _LAT_DEG_PER_M, _LON_DEG_PER_M
+from logging_config import configure_logging
+from poly_raster import (
+    _PolyRaster,
+    _ua_fetch_all_in_bbox, _wis_fetch_all_in_bbox,
+    _rasterise_layer,
+)
+from queries import (
+    query_nearest, query_radius,
+    query_urban_atlas_luc_fraction, query_wis_fraction,
+    batch_nearest, batch_radius,
+    batch_urban_atlas_luc_fraction, batch_wis_fraction,
 )
 
-
-# ---------------------------------------------------------------------------
-# Connections — live database handles, one per thread
-# ---------------------------------------------------------------------------
-class Connections:
-    """
-    Per-thread database connections opened lazily.
-
-    Passed to every feature callable so they can issue their own queries
-    without going through the main streaming cursor.
-    """
-
-    def __init__(self, prepared: Path, catalog_meta: dict):
-        self._prepared   = prepared
-        self._meta       = catalog_meta          # dataset_id → metadata row
-        self._duckdb:    Dict[str, duckdb.DuckDBPyConnection] = {}
-        self._spatialite: Dict[str, sqlite3.Connection]        = {}
-
-    def duckdb(self, db_file: str) -> duckdb.DuckDBPyConnection:
-        if db_file not in self._duckdb:
-            path = self._prepared / db_file
-            self._duckdb[db_file] = duckdb.connect(str(path), read_only=True)
-        return self._duckdb[db_file]
-
-    def spatialite(self, db_file: str) -> sqlite3.Connection:
-        if db_file not in self._spatialite:
-            path = self._prepared / db_file
-            conn = sqlite3.connect(str(path))
-            conn.enable_load_extension(True)
-            for lib in ["mod_spatialite", "mod_spatialite.so",
-                        "mod_spatialite.dylib",
-                        "/usr/lib/x86_64-linux-gnu/mod_spatialite.so"]:
-                try:
-                    conn.load_extension(lib)
-                    break
-                except sqlite3.OperationalError:
-                    continue
-            conn.row_factory = sqlite3.Row
-            self._spatialite[db_file] = conn
-        return self._spatialite[db_file]
-
-    def close(self):
-        for c in self._duckdb.values():
-            try: c.close()
-            except Exception: pass
-        for c in self._spatialite.values():
-            try: c.close()
-            except Exception: pass
-        self._duckdb.clear()
-        self._spatialite.clear()
+log = logging.getLogger("stream")
 
 
 # ---------------------------------------------------------------------------
-# Core spatial/temporal query helpers (public — usable in custom features)
-# ---------------------------------------------------------------------------
-
-def _temporal_clause(temporal: str, ts_col: str, driving_ts: str) -> str:
-    """Return a SQL WHERE fragment for temporal filtering."""
-    if temporal == "last_previous":
-        return f"AND {ts_col} <= '{driving_ts}'"
-    if temporal == "nearest":
-        return ""   # handled via ORDER BY in the calling query
-    return ""       # "none"
-
-
-def _temporal_order(temporal: str, ts_col: str, driving_ts: str) -> str:
-    """Return a SQL ORDER BY fragment for temporal ordering."""
-    if temporal == "last_previous":
-        return f"{ts_col} DESC"
-    if temporal == "nearest":
-        return f"ABS(strftime('%s', {ts_col}) - strftime('%s', '{driving_ts}'))"
-    return "1"   # no ordering preference for static datasets
-
-
-def query_nearest(
-    conn: Connections,
-    dataset_id: str,
-    lon: float,
-    lat: float,
-    timestamp: str,
-    columns: List[str],
-    temporal: str = "none",
-    radius_m: float = 500.0,
-) -> dict:
-    """
-    Find the single spatially nearest point in *dataset_id*, optionally
-    filtered/ordered by time.
-
-    Returns a dict of {column: value} for the nearest row, or {} if none found.
-
-    This is the low-level building block used by the nearest() factory and
-    available to custom feature callables.
-    """
-    meta    = conn._meta[dataset_id]
-    store   = meta["store"]
-    table   = meta["db_table"]
-    db_file = meta["db_file"]
-    ts_col  = meta.get("timestamp_column", "timestamp")
-    has_ts  = meta["temporal_behavior"] != "static"
-
-    cols_sql = ", ".join(columns)
-    t_where  = _temporal_clause(temporal, ts_col, timestamp) if has_ts else ""
-    t_order  = _temporal_order(temporal, ts_col, timestamp)  if has_ts else "1"
-
-    if store == "spatialite":
-        db = conn.spatialite(db_file)
-        # Bounding-box pre-filter via R-tree, then exact distance ordering
-        dlat = radius_m * _LAT_DEG_PER_M
-        dlon = radius_m * _LON_DEG_PER_M
-        sql = f"""
-            SELECT {cols_sql},
-                   Distance(geom, MakePoint(?, ?, 4326)) AS _dist
-            FROM {table}
-            WHERE id IN (
-                SELECT id FROM SpatialIndex
-                WHERE f_table_name = '{table}'
-                  AND search_frame = BuildMbr(?, ?, ?, ?, 4326)
-            )
-            {t_where}
-            ORDER BY _dist ASC, {t_order}
-            LIMIT 1
-        """
-        params = (lon, lat,
-                  lon - dlon, lat - dlat, lon + dlon, lat + dlat)
-        cur = db.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else {}
-
-    else:  # duckdb
-        db = conn.duckdb(db_file)
-        sql = f"""
-            SELECT {cols_sql},
-                   sqrt(pow((longitude - {lon}) * 111320, 2)
-                      + pow((latitude  - {lat}) * 111320
-                          * cos(radians({lat})), 2)) AS _dist
-            FROM {table}
-            WHERE longitude BETWEEN {lon - radius_m * _LON_DEG_PER_M}
-                              AND {lon + radius_m * _LON_DEG_PER_M}
-              AND latitude  BETWEEN {lat - radius_m * _LAT_DEG_PER_M}
-                              AND {lat + radius_m * _LAT_DEG_PER_M}
-            {t_where}
-            ORDER BY _dist ASC, {t_order}
-            LIMIT 1
-        """
-        row = db.execute(sql).fetchone()
-        if row is None:
-            return {}
-        desc = db.description
-        return {desc[i][0]: row[i] for i in range(len(desc))}
-
-
-def query_radius(
-    conn: Connections,
-    dataset_id: str,
-    lon: float,
-    lat: float,
-    timestamp: str,
-    radius_m: float,
-    columns: List[str],
-    agg: str,
-    temporal: str = "none",
-) -> dict:
-    """
-    Aggregate all points within *radius_m* metres of (lon, lat).
-
-    *agg* is one of: "count", "avg", "sum", "min", "max".
-    Returns {f"{col}_{agg}": value, "count": n} or {"count": 0} if empty.
-
-    This is the low-level building block used by aggregate_in_radius() and
-    available to custom feature callables.
-    """
-    meta    = conn._meta[dataset_id]
-    store   = meta["store"]
-    table   = meta["db_table"]
-    db_file = meta["db_file"]
-    ts_col  = meta.get("timestamp_column", "timestamp")
-    has_ts  = meta["temporal_behavior"] != "static"
-
-    t_where = _temporal_clause(temporal, ts_col, timestamp) if has_ts else ""
-    agg_up  = agg.upper()
-    agg_sql = ", ".join(
-        f"{agg_up}(CAST({c} AS REAL)) AS {c}_{agg}" for c in columns
-        if agg_up != "COUNT"
-    )
-    count_sql = "COUNT(*) AS count"
-    select_sql = f"{count_sql}" + (f", {agg_sql}" if agg_sql else "")
-
-    if store == "spatialite":
-        db = conn.spatialite(db_file)
-        dlat = radius_m * _LAT_DEG_PER_M
-        dlon = radius_m * _LON_DEG_PER_M
-        sql = f"""
-            SELECT {select_sql}
-            FROM {table}
-            WHERE id IN (
-                SELECT id FROM SpatialIndex
-                WHERE f_table_name = '{table}'
-                  AND search_frame = BuildMbr(?, ?, ?, ?, 4326)
-            )
-              AND Distance(geom, MakePoint(?, ?, 4326)) <= ?
-            {t_where}
-        """
-        params = (lon - dlon, lat - dlat, lon + dlon, lat + dlat,
-                  lon, lat, radius_m / 111_320.0)
-        cur = db.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else {"count": 0}
-
-    else:  # duckdb
-        db = conn.duckdb(db_file)
-        radius_deg = radius_m / 111_320.0
-        sql = f"""
-            SELECT {select_sql}
-            FROM {table}
-            WHERE longitude BETWEEN {lon - radius_m * _LON_DEG_PER_M}
-                              AND {lon + radius_m * _LON_DEG_PER_M}
-              AND latitude  BETWEEN {lat - radius_m * _LAT_DEG_PER_M}
-                              AND {lat + radius_m * _LAT_DEG_PER_M}
-              AND sqrt(pow((longitude - {lon}) * 111320, 2)
-                     + pow((latitude  - {lat}) * 111320
-                         * cos(radians({lat})), 2)) <= {radius_m}
-            {t_where}
-        """
-        row = db.execute(sql).fetchone()
-        if row is None:
-            return {"count": 0}
-        desc = db.description
-        return {desc[i][0]: row[i] for i in range(len(desc))}
-
-
-# ---------------------------------------------------------------------------
-# Feature descriptor — stores both a batch path and a row-level fallback
-# ---------------------------------------------------------------------------
-class _FeatureDescriptor:
-    """
-    Describes one registered feature.
-
-    Framework features (nearest, aggregate_in_radius) provide compute_batch()
-    which issues one SQL query per feature per batch against a temporary
-    coordinate table loaded into SpatiaLite or DuckDB.
-
-    Custom features provide compute_row() which is called once per row and
-    may use query_nearest() / query_radius() to reuse framework logic.
-    """
-    __slots__ = ("name", "prefix", "_batch_fn", "_row_fn")
-
-    def __init__(
-        self,
-        name:     str,
-        prefix:   str,
-        batch_fn: Optional[Callable] = None,   # (df, conns) -> pd.Series per column
-        row_fn:   Optional[Callable] = None,   # (row, conns) -> dict
-    ):
-        self.name     = name
-        self.prefix   = prefix
-        self._batch_fn = batch_fn
-        self._row_fn   = row_fn
-
-    @property
-    def is_batchable(self) -> bool:
-        return self._batch_fn is not None
-
-    def compute_batch(
-        self, df: pd.DataFrame, conns: "Connections"
-    ) -> pd.DataFrame:
-        """
-        Compute this feature for all rows in df at once.
-        Returns a DataFrame with one column per output key, same index as df.
-        """
-        result = self._batch_fn(df, conns)
-        if self.prefix:
-            result = result.rename(columns={c: f"{self.prefix}{c}" for c in result.columns})
-        return result
-
-    def compute_row(self, row: "FeatureRow", conns: "Connections") -> dict:
-        """Compute this feature for a single row (custom callables only)."""
-        result = self._row_fn(row, conns)
-        if self.prefix:
-            return {f"{self.prefix}{k}": v for k, v in result.items()}
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Batch spatial query helpers — one query per feature per batch
-# ---------------------------------------------------------------------------
-
-def _load_temp_points(
-    db: sqlite3.Connection,
-    df: pd.DataFrame,
-    temp_table: str = "_batch_pts",
-) -> None:
-    """
-    Load (row_idx, lon, lat, ts) from df into a SpatiaLite temp table.
-
-    Uses a single executemany call so the entire batch crosses the Python/
-    SQLite boundary in one round-trip.  The geometry column lets SpatiaLite
-    join against the R-tree index of the feature table.
-    """
-    db.execute(f"DROP TABLE IF EXISTS {temp_table}")
-    db.execute(f"""
-        CREATE TEMPORARY TABLE {temp_table} (
-            row_idx INTEGER PRIMARY KEY,
-            lon     REAL,
-            lat     REAL,
-            ts      TEXT
-        )
-    """)
-    db.executemany(
-        f"INSERT INTO {temp_table}(row_idx, lon, lat, ts) VALUES (?,?,?,?)",
-        [
-            (int(i), float(row.longitude), float(row.latitude), str(row.timestamp))
-            for i, row in df.iterrows()
-        ],
-    )
-
-
-def batch_nearest(
-    df: pd.DataFrame,
-    conns: Connections,
-    dataset_id: str,
-    columns: List[str],
-    temporal: str,
-    radius_m: float,
-) -> pd.DataFrame:
-    """
-    Find the nearest point in *dataset_id* for every row in *df*.
-
-    Issues one SQL query per feature per batch.  The spatial filter is a
-    degree-space bounding box around each input coordinate — it is not
-    restricted to any tile boundary, so feature points from neighbouring tiles
-    are included whenever they fall inside the search radius.
-
-    SpatiaLite path:
-        Loads all input coordinates into a temporary table, then joins against
-        the R-tree spatial index with a per-point bounding box.  A correlated
-        subquery selects the single closest feature point per input row,
-        breaking ties by temporal ordering when requested.
-
-    DuckDB path:
-        Builds a CTE VALUES list and uses ROW_NUMBER() OVER (PARTITION BY
-        row_idx ORDER BY distance) to pick the winner in one query.
-
-    Returns a DataFrame indexed like df with one column per requested feature
-    column (None where no point was found within radius_m).
-    """
-    meta    = conns._meta[dataset_id]
-    store   = meta["store"]
-    table   = meta["db_table"]
-    db_file = meta["db_file"]
-    has_ts  = meta["temporal_behavior"] != "static"
-
-    cols_select = ", ".join(f"f.{c}" for c in columns)
-    dlat = radius_m * _LAT_DEG_PER_M
-    dlon = radius_m * _LON_DEG_PER_M
-
-    result = pd.DataFrame(index=df.index, columns=columns, dtype=object)
-
-    if store == "spatialite":
-        db = conns.spatialite(db_file)
-        _load_temp_points(db, df)
-
-        if has_ts and temporal == "last_previous":
-            t_where      = "AND f.timestamp <= p.ts"
-            t_tiebreak   = "f.timestamp DESC,"
-        elif has_ts and temporal == "nearest":
-            t_where      = ""
-            t_tiebreak   = "ABS(strftime('%s', f.timestamp) - strftime('%s', p.ts)),"
-        else:
-            t_where      = ""
-            t_tiebreak   = ""
-
-        # Correlated subquery approach:
-        # For each input point p, find all candidate feature rows via the
-        # R-tree bounding box (includes any tile within the search box), apply
-        # exact distance filter, then order by temporal + distance and take 1.
-        # This is a single SQL statement — SQLite executes the correlated
-        # subquery once per row in _batch_pts using the R-tree index.
-        sql = f"""
-            SELECT p.row_idx,
-                   (
-                       SELECT {cols_select}
-                       FROM {table} f
-                       WHERE f.id IN (
-                           SELECT id FROM SpatialIndex
-                           WHERE f_table_name = '{table}'
-                             AND search_frame = BuildMbr(
-                                 p.lon - {dlon}, p.lat - {dlat},
-                                 p.lon + {dlon}, p.lat + {dlat}, 4326)
-                       )
-                       {t_where}
-                       ORDER BY {t_tiebreak}
-                                Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
-                       LIMIT 1
-                   ) AS _nearest_cols
-            FROM _batch_pts p
-            ORDER BY p.row_idx
-        """
-        # SQLite can only return one expression from a correlated scalar
-        # subquery.  For multi-column results we query each column separately.
-        col_results: Dict[str, list] = {c: [None] * len(df) for c in columns}
-        for col_idx, col in enumerate(columns):
-            col_sql = f"""
-                SELECT p.row_idx,
-                       (
-                           SELECT f.{col}
-                           FROM {table} f
-                           WHERE f.id IN (
-                               SELECT id FROM SpatialIndex
-                               WHERE f_table_name = '{table}'
-                                 AND search_frame = BuildMbr(
-                                     p.lon - {dlon}, p.lat - {dlat},
-                                     p.lon + {dlon}, p.lat + {dlat}, 4326)
-                           )
-                           {t_where}
-                           ORDER BY {t_tiebreak}
-                                    Distance(f.geom, MakePoint(p.lon, p.lat, 4326))
-                           LIMIT 1
-                       ) AS val
-                FROM _batch_pts p
-                ORDER BY p.row_idx
-            """
-            rows = db.execute(col_sql).fetchall()
-            # rows is ordered by row_idx; map back to DataFrame index
-            idx_map = dict(zip(df.index, range(len(df))))
-            for row_idx_val, val in rows:
-                col_results[col][row_idx_val] = val
-
-        for col in columns:
-            for pos, idx in enumerate(df.index):
-                result.at[idx, col] = col_results[col][pos]
-
-    else:  # duckdb — already correct, no tile filtering
-        db = conns.duckdb(db_file)
-        pts_values = ", ".join(
-            f"({int(i)}, {float(row.longitude)}, {float(row.latitude)}, "
-            f"'{row.timestamp}')"
-            for i, row in df.iterrows()
-        )
-        if has_ts and temporal == "last_previous":
-            t_where  = "AND f.timestamp <= p.ts"
-            t_order  = "f.timestamp DESC,"
-        elif has_ts and temporal == "nearest":
-            t_where  = ""
-            t_order  = ("ABS(epoch(CAST(f.timestamp AS TIMESTAMP))"
-                        " - epoch(CAST(p.ts AS TIMESTAMP))),")
-        else:
-            t_where  = ""
-            t_order  = ""
-
-        sql = f"""
-            WITH pts(row_idx, lon, lat, ts) AS (
-                VALUES {pts_values}
-            ),
-            ranked AS (
-                SELECT p.row_idx,
-                       {cols_select},
-                       ROW_NUMBER() OVER (
-                           PARTITION BY p.row_idx
-                           ORDER BY {t_order}
-                               sqrt(pow((f.longitude - p.lon) * 111320, 2)
-                                  + pow((f.latitude  - p.lat) * 111320
-                                      * cos(radians(p.lat)), 2))
-                       ) AS rn
-                FROM pts p
-                JOIN {table} f
-                  ON f.longitude BETWEEN p.lon - {dlon} AND p.lon + {dlon}
-                 AND f.latitude  BETWEEN p.lat - {dlat} AND p.lat + {dlat}
-                 AND sqrt(pow((f.longitude - p.lon) * 111320, 2)
-                        + pow((f.latitude  - p.lat) * 111320
-                            * cos(radians(p.lat)), 2)) <= {radius_m}
-                {t_where}
-            )
-            SELECT row_idx, {", ".join(columns)}
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY row_idx
-        """
-        rows = db.execute(sql).fetchall()
-        desc = [d[0] for d in db.description]
-        col_positions = {c: desc.index(c) for c in columns}
-        for r in rows:
-            idx = r[0]
-            for col in columns:
-                result.at[idx, col] = r[col_positions[col]]
-
-    return result
-
-
-def batch_radius(
-    df: pd.DataFrame,
-    conns: Connections,
-    dataset_id: str,
-    columns: List[str],
-    agg: str,
-    temporal: str,
-    radius_m: float,
-) -> pd.DataFrame:
-    """
-    Aggregate all points within *radius_m* metres for every row in *df*.
-
-    The spatial filter is a degree-space bounding box centred on the exact
-    pixel coordinate, followed by an exact Distance() check.  It is not
-    restricted to any tile boundary, so feature points from neighbouring tiles
-    are always included when they fall inside the search radius.
-
-    One R-tree query is issued per unique (tile_id, date) pair.  This is
-    correct and not just an optimisation: all pixels that share a tile_id
-    are within the same ~200 m H3 cell, so the set of feature points captured
-    by a circle of radius_m drawn from any pixel in the tile is the same for
-    practical search radii (≥ ~30 m).  The query always uses the exact pixel
-    coordinates for the bounding box, not a tile centroid, so edge pixels that
-    happen to share a tile with interior pixels use their own coordinates.
-
-    Returns a DataFrame indexed like df with columns {col}_{agg} and "count".
-    """
-    meta    = conns._meta[dataset_id]
-    store   = meta["store"]
-    table   = meta["db_table"]
-    db_file = meta["db_file"]
-    has_ts  = meta["temporal_behavior"] != "static"
-
-    agg_up  = agg.upper()
-    agg_sql = ", ".join(
-        f"{agg_up}(CAST(f.{c} AS REAL)) AS {c}_{agg}"
-        for c in columns if agg_up != "COUNT"
-    )
-    out_cols   = ["count"] + [f"{c}_{agg}" for c in columns if agg_up != "COUNT"]
-    select_sql = "COUNT(*) AS count" + (f", {agg_sql}" if agg_sql else "")
-    result     = pd.DataFrame(index=df.index, columns=out_cols, dtype=object)
-
-    dlat = radius_m * _LAT_DEG_PER_M
-    dlon = radius_m * _LON_DEG_PER_M
-
-    if has_ts and temporal in ("last_previous", "nearest"):
-        # For radius aggregates both temporal modes use "all observations up to
-        # and including the driving timestamp" — the nearest-in-time semantics
-        # of aggregate-in-radius mean "the most recent snapshot available",
-        # which is the same filter.
-        t_where_tpl = "AND f.timestamp <= '{ts}'"
-    else:
-        t_where_tpl = ""
-
-    # Cache keyed on (tile_id, date): pixels within the same H3 cell on the
-    # same date share the same aggregate result.  The bounding box is computed
-    # from the representative pixel's exact coordinates, not a tile centroid,
-    # so the R-tree pre-filter is accurate.  For static datasets the date key
-    # is omitted since there is no temporal dimension.
-    cache: Dict[str, dict] = {}
-
-    for idx in df.index:
-        row     = df.loc[idx]
-        lon     = float(row.longitude)
-        lat     = float(row.latitude)
-        ts      = str(row.timestamp)
-        tile_id = str(row.tile_id)
-
-        date_key  = ts[:10] if has_ts else "static"
-        cache_key = f"{tile_id}:{date_key}"
-
-        if cache_key not in cache:
-            t_where = t_where_tpl.format(ts=ts) if t_where_tpl else ""
-
-            if store == "spatialite":
-                db  = conns.spatialite(db_file)
-                sql = f"""
-                    SELECT {select_sql}
-                    FROM {table} f
-                    WHERE f.id IN (
-                        SELECT id FROM SpatialIndex
-                        WHERE f_table_name = '{table}'
-                          AND search_frame = BuildMbr(?, ?, ?, ?, 4326)
-                    )
-                      AND Distance(f.geom, MakePoint(?, ?, 4326)) <= ?
-                    {t_where}
-                """
-                db_row = db.execute(
-                    sql,
-                    (lon - dlon, lat - dlat, lon + dlon, lat + dlat,
-                     lon, lat, radius_m / 111_320.0),
-                ).fetchone()
-
-            else:  # duckdb
-                db  = conns.duckdb(db_file)
-                sql = f"""
-                    SELECT {select_sql}
-                    FROM {table} f
-                    WHERE f.longitude BETWEEN {lon - dlon} AND {lon + dlon}
-                      AND f.latitude  BETWEEN {lat - dlat} AND {lat + dlat}
-                      AND sqrt(pow((f.longitude - {lon}) * 111320, 2)
-                             + pow((f.latitude  - {lat}) * 111320
-                                 * cos(radians({lat})), 2)) <= {radius_m}
-                    {t_where}
-                """
-                db_row = db.execute(sql).fetchone()
-
-            cache[cache_key] = (
-                dict(zip(out_cols, db_row)) if db_row else {"count": 0}
-            )
-
-        row_result = cache[cache_key]
-        for col in out_cols:
-            result.at[idx, col] = row_result.get(col)
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Feature factories  (the 2×2 framework)
-# ---------------------------------------------------------------------------
-
-def nearest(
-    dataset_id: str,
-    columns: List[str],
-    temporal: str = "none",
-    radius_m: float = 500.0,
-    prefix: str = "",
-) -> _FeatureDescriptor:
-    """
-    Factory: nearest point in *dataset_id* to the driving LST pixel.
-
-    Parameters
-    ----------
-    dataset_id : registered dataset (e.g. "dhm1", "ndvi")
-    columns    : which columns to return from the nearest row
-    temporal   : "none"          — ignore timestamps (static datasets)
-                 "last_previous" — most recent observation with ts <= driving_ts
-                 "nearest"       — observation closest in time to driving_ts
-    radius_m   : search radius in metres (R-tree pre-filter)
-    prefix     : optional column name prefix in the output
-
-    Implementation
-    --------------
-    Issues one batch spatial JOIN per feature per batch, not one query per row.
-    Custom callables can reuse the row-level helper:
-        result = query_nearest(conns, "dhm1", row.longitude, row.latitude,
-                               row.timestamp, ["elevation"], temporal="nearest")
-    """
-    if temporal not in ("none", "last_previous", "nearest"):
-        raise ValueError(f"temporal must be 'none', 'last_previous' or 'nearest', got {temporal!r}")
-
-    _prefix = prefix or f"{dataset_id}_"
-
-    def _batch(df: pd.DataFrame, conns: Connections) -> pd.DataFrame:
-        return batch_nearest(df, conns, dataset_id, columns, temporal, radius_m)
-
-    def _row(row: FeatureRow, conns: Connections) -> dict:
-        return query_nearest(conns, dataset_id,
-                             row.longitude, row.latitude, row.timestamp,
-                             columns=columns, temporal=temporal, radius_m=radius_m)
-
-    return _FeatureDescriptor(
-        name=f"nearest_{dataset_id}_{temporal}",
-        prefix=_prefix,
-        batch_fn=_batch,
-        row_fn=_row,
-    )
-
-
-def aggregate_in_radius(
-    dataset_id: str,
-    radius_m: float,
-    columns: List[str],
-    agg: str = "count",
-    temporal: str = "none",
-    prefix: str = "",
-) -> _FeatureDescriptor:
-    """
-    Factory: aggregate all points within *radius_m* metres of each driving pixel.
-
-    Parameters
-    ----------
-    dataset_id : registered dataset
-    radius_m   : search radius in metres
-    columns    : columns to aggregate (ignored when agg="count")
-    agg        : "count", "avg", "sum", "min", or "max"
-    temporal   : same as nearest()
-    prefix     : optional column name prefix
-
-    Implementation
-    --------------
-    Applies tile-level deduplication: all pixels in the same H3 tile share
-    one aggregate result, reducing queries to N_unique_tiles per batch.
-    Custom callables can reuse the row-level helper:
-        result = query_radius(conns, "trees", row.longitude, row.latitude,
-                              row.timestamp, radius_m=25.0,
-                              columns=[], agg="count", temporal="none")
-    """
-    if agg not in ("count", "avg", "sum", "min", "max"):
-        raise ValueError(f"agg must be one of count/avg/sum/min/max, got {agg!r}")
-    if temporal not in ("none", "last_previous", "nearest"):
-        raise ValueError(f"temporal must be 'none', 'last_previous' or 'nearest', got {temporal!r}")
-
-    _prefix = prefix or f"{dataset_id}_{agg}{int(radius_m)}m_"
-
-    def _batch(df: pd.DataFrame, conns: Connections) -> pd.DataFrame:
-        return batch_radius(df, conns, dataset_id, columns, agg, temporal, radius_m)
-
-    def _row(row: FeatureRow, conns: Connections) -> dict:
-        return query_radius(conns, dataset_id,
-                            row.longitude, row.latitude, row.timestamp,
-                            radius_m=radius_m, columns=columns,
-                            agg=agg, temporal=temporal)
-
-    return _FeatureDescriptor(
-        name=f"radius_{dataset_id}_{agg}_{int(radius_m)}m_{temporal}",
-        prefix=_prefix,
-        batch_fn=_batch,
-        row_fn=_row,
-    )
-
-
-# ---------------------------------------------------------------------------
-# FeatureRegistry
-# ---------------------------------------------------------------------------
-class FeatureRegistry:
-    """
-    Holds all registered feature descriptors.
-
-    Usage
-    -----
-        reg = FeatureRegistry()
-        reg.add(nearest("dhm1", ["elevation"], temporal="last_previous"))
-        reg.add(aggregate_in_radius("trees", 50, [], agg="count"))
-        reg.add_custom(my_fn, name="my_feature")
-    """
-
-    def __init__(self):
-        self._descriptors: List[_FeatureDescriptor] = []
-
-    def add(self, descriptor: _FeatureDescriptor) -> "FeatureRegistry":
-        """Register a feature produced by nearest() or aggregate_in_radius()."""
-        self._descriptors.append(descriptor)
-        return self
-
-    def add_custom(
-        self,
-        fn: Callable[["FeatureRow", "Connections"], dict],
-        name: str,
-        prefix: str = "",
-    ) -> "FeatureRegistry":
-        """
-        Register a custom feature callable.
-
-        The callable receives (row: FeatureRow, conns: Connections) and returns
-        a dict of {column_name: value}.  It can reuse framework logic via:
-            from stream import query_nearest, query_radius
-        """
-        self._descriptors.append(
-            _FeatureDescriptor(name=name, prefix=prefix, row_fn=fn)
-        )
-        return self
-
-    @property
-    def _batch_descriptors(self) -> List[_FeatureDescriptor]:
-        return [d for d in self._descriptors if d.is_batchable]
-
-    @property
-    def _row_descriptors(self) -> List[_FeatureDescriptor]:
-        return [d for d in self._descriptors if not d.is_batchable]
-
-    def compute_batch_features(
-        self, df: pd.DataFrame, conns: "Connections"
-    ) -> pd.DataFrame:
-        """
-        Compute all batchable features for the entire df in bulk SQL.
-        Returns a DataFrame with one column per output, indexed like df.
-        """
-        parts = []
-        for desc in self._batch_descriptors:
-            try:
-                parts.append(desc.compute_batch(df, conns))
-            except Exception as exc:
-                # Fill with None so the row is still emitted
-                err_col = f"_err_{desc.name}"
-                parts.append(pd.DataFrame(
-                    {err_col: str(exc)}, index=df.index
-                ))
-        return pd.concat(parts, axis=1) if parts else pd.DataFrame(index=df.index)
-
-    def compute_row_features(
-        self, raw_rows: list, conns: "Connections"
-    ) -> pd.DataFrame:
-        """
-        Compute all custom (row-level) features.
-        Accumulates into pre-allocated column arrays to avoid list-of-dicts overhead.
-        Returns a DataFrame with one column per output, indexed 0..N-1.
-        """
-        if not self._row_descriptors:
-            return pd.DataFrame()
-
-        n = len(raw_rows)
-        # Pre-allocate: discover column names from first non-erroring row
-        col_arrays: Dict[str, list] = {}
-        for i, raw_row in enumerate(raw_rows):
-            row = FeatureRow(*raw_row)
-            for desc in self._row_descriptors:
-                try:
-                    result = desc.compute_row(row, conns)
-                except Exception as exc:
-                    result = {f"_err_{desc.name}": str(exc)}
-                for k, v in result.items():
-                    if k not in col_arrays:
-                        col_arrays[k] = [None] * n
-                    col_arrays[k][i] = v
-        return pd.DataFrame(col_arrays)
-
-    def __len__(self) -> int:
-        return len(self._descriptors)
-
-
-# ---------------------------------------------------------------------------
-# DistributionTarget
-# ---------------------------------------------------------------------------
-class DistributionTarget:
-    """
-    Target temperature distribution for weighted partition sampling.
-
-    Parameters
-    ----------
-    target : dict mapping temperature bin *lower edge* (°C) to desired proportion.
-             Proportions are normalised to sum to 1.
-             Example:  {15: 0.20, 20: 0.30, 25: 0.30, 30: 0.15, 35: 0.05}
-
-    The histogram bins in catalog.duckdb use 2 °C edges from -10 to 60 °C.
-    Each key in *target* is matched to the closest bin lower edge.
-    """
-
-    def __init__(self, target: Dict[float, float]):
-        total = sum(target.values())
-        self.target = {float(k): v / total for k, v in target.items()}
-
-    def partition_weight(
-        self,
-        hist_counts: List[int],
-        bin_edges: List[float],
-    ) -> float:
-        """
-        Score a partition by how much it contributes to the target distribution.
-
-        Returns a weight ∈ [0, 1].  Partitions with weight 0 are skipped.
-        """
-        total = sum(hist_counts)
-        if total == 0:
-            return 0.0
-        score = 0.0
-        for temp_edge, desired_prop in self.target.items():
-            # Find the bin index for this edge
-            bin_idx = min(
-                range(len(bin_edges) - 1),
-                key=lambda i: abs(bin_edges[i] - temp_edge),
-            )
-            actual_prop = hist_counts[bin_idx] / total
-            score += min(actual_prop, desired_prop)
-        return score
-
-
-# ---------------------------------------------------------------------------
-# StreamConfig — main user-facing object
+# StreamConfig
 # ---------------------------------------------------------------------------
 class StreamConfig:
     """
@@ -982,12 +140,40 @@ class StreamConfig:
     batch_size    : rows yielded per DataFrame batch.
     partition_keys: optional list of "YYYY-MM" strings to restrict streaming to
                     specific months.  Default: all months.
+    lst_emissivity_mode: How to resolve LST from 3 emissivity columns (ASTER/MODIS/NDVI).
+                    "any" (default): first non-null in order ASTER > MODIS > NDVI
+                    "fallback": ASTER > MODIS (NDVI excluded)
+                    "aster"/"modis"/"ndvi": use only that column
+    lst_null_handling: "skip" (default) or "impute". Controls row filtering when LST is null.
 
-    Example
-    -------
+    Distribution Targeting
+    ----------------------
+    Supports weighted sampling based on target distributions across dimensions:
+      - temperature: LST values in degrees C
+      - timestamp: observation dates (ISO format)
+      - longitude / latitude: geographic coordinates
+
+    Examples
+    --------
+    Temperature-only (backwards compatible):
         cfg = StreamConfig(Path("prepared_stream_data"))
         cfg.set_distribution({20: 0.4, 25: 0.4, 30: 0.2})
 
+    With emissivity control:
+        cfg = StreamConfig(
+            Path("prepared_stream_data"),
+            lst_emissivity_mode="fallback",  # ASTER > MODIS only
+            lst_null_handling="impute"
+        )
+
+    Multi-dimensional (temperature + geographic location):
+        cfg = StreamConfig(Path("prepared_stream_data"))
+        cfg.set_distribution({
+            "temperature": ({20: 0.3, 25: 0.4, 30: 0.3}, bin_edges_temp),
+            "longitude": ({3.2: 0.5, 3.3: 0.5}, bin_edges_lon),
+        })
+
+    Streaming:
         reg = FeatureRegistry()
         reg.add(nearest("dhm1", ["elevation"], temporal="last_previous"))
         reg.add(aggregate_in_radius("trees", 50, [], agg="count"))
@@ -1001,19 +187,131 @@ class StreamConfig:
         prepared_data: Path = DEFAULT_PREPARED,
         batch_size: int = 10_000,
         partition_keys: Optional[List[str]] = None,
+        raster_resolution_m: float = 15.0,
+        lst_emissivity_mode: str = "any",
+        lst_null_handling: str = "skip",
     ):
-        self.prepared      = Path(prepared_data)
-        self.batch_size    = batch_size
-        self._partitions   = partition_keys   # None → all
+        """
+        Parameters
+        ----------
+        prepared_data        : Path to prepared_stream_data/ from ingest.py.
+        batch_size           : Rows per yielded DataFrame batch.
+        partition_keys       : Restrict to specific YYYY-MM months.  None = all.
+        raster_resolution_m  : Grid spacing for the precomputed polygon-fraction
+                               raster (Urban Atlas and WIS).  Default 15 m =
+                               half the 30 m LST pixel spacing, so every LST
+                               pixel maps to a precomputed point within ~7.5 m —
+                               well inside the acceptable margin for any query
+                               radius >= 100 m.  Set 0 to disable precomputation
+                               and always use the live Shapely path.
+        lst_emissivity_mode  : How to select LST value from 3 emissivity sources:
+                               "any" (default): first non-null (ASTER > MODIS > NDVI)
+                               "fallback": ASTER > MODIS, never NDVI
+                               "aster": return aster_lst only (null if missing)
+                               "modis": return modis_lst only (null if missing)
+                               "ndvi": return ndvi only (null if missing)
+        lst_null_handling    : How to handle rows with null LST value:
+                               "skip" (default): drop rows where selected LST is null
+                               "impute": use fallback column if primary is null
+                                        (only ASTER/MODIS can fallback to each other)
+        """
+        self.prepared            = Path(prepared_data)
+        self.batch_size          = batch_size
+        self._partitions         = partition_keys   # None -> all
+        self.raster_resolution_m = raster_resolution_m
+        self.lst_emissivity_mode = lst_emissivity_mode
+        self.lst_null_handling   = lst_null_handling
         self._distribution: Optional[DistributionTarget] = None
         self._catalog_meta: Optional[dict] = None
-        self._bin_edges:    Optional[List[float]] = None
+        self._bin_edges_dict: Dict[str, List[float]] = {}  # temperature, timestamp, longitude, latitude
         self._partition_stats: Optional[List[dict]] = None
 
-    def set_distribution(self, target: Dict[float, float]) -> "StreamConfig":
-        """Define a target temperature distribution for weighted sampling."""
+    def set_distribution(self, target: Dict) -> "StreamConfig":
+        """
+        Define a target distribution for weighted sampling.
+
+        Supports both simple temperature-only and multi-dimensional targeting.
+
+        Parameters
+        ----------
+        target : dict
+            For simple temperature-only (backwards compatible):
+                {15: 0.2, 20: 0.3, 25: 0.3, 30: 0.2}
+            For multi-dimensional:
+                {
+                    "temperature": ({15: 0.2, 20: 0.3, 25: 0.3, 30: 0.2}, bin_edges),
+                    "timestamp": ({...}, bin_edges),
+                    ...
+                }
+        """
         self._distribution = DistributionTarget(target)
         return self
+
+    def _resolve_lst_temperature(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Resolve LST temperature from 3 emissivity sources (aster_lst, modis_lst, ndvi).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with columns: aster_lst, modis_lst, ndvi
+
+        Returns
+        -------
+        np.ndarray
+            Temperature column (1D array of floats, with NaN for unresolvable rows).
+            Behavior determined by self.lst_emissivity_mode and self.lst_null_handling.
+
+        Mode semantics
+        -----------
+        "any"        : first non-null in order [aster_lst, modis_lst, ndvi]
+        "fallback"   : first non-null in order [aster_lst, modis_lst] (never NDVI)
+        "aster"      : aster_lst only (NaN if missing)
+        "modis"      : modis_lst only (NaN if missing)
+        "ndvi"       : ndvi only (NaN if missing)
+
+        Null handling after resolution
+        "skip"       : rows with null LST remain NaN (caller may filter)
+        "impute"     : fallback to next source if primary is null (ASTER<->MODIS only)
+        """
+        aster = df["aster_lst"].to_numpy()
+        modis = df["modis_lst"].to_numpy()
+        ndvi = df["ndvi"].to_numpy()
+
+        mode = self.lst_emissivity_mode.lower()
+        handling = self.lst_null_handling.lower()
+
+        if mode == "any":
+            # First non-null in [aster, modis, ndvi]
+            temp = np.where(pd.notna(aster), aster,
+                   np.where(pd.notna(modis), modis, ndvi))
+
+        elif mode == "fallback":
+            # First non-null in [aster, modis] only (never NDVI)
+            temp = np.where(pd.notna(aster), aster, modis)
+
+        elif mode == "aster":
+            temp = aster.copy()
+
+        elif mode == "modis":
+            temp = modis.copy()
+
+        elif mode == "ndvi":
+            temp = ndvi.copy()
+
+        else:
+            raise ValueError(f"Unknown lst_emissivity_mode: {mode}")
+
+        # Apply null handling (impute: fallback to next source)
+        if handling == "impute" and mode in ("aster", "modis"):
+            if mode == "aster":
+                # Fallback ASTER -> MODIS (never NDVI)
+                temp = np.where(pd.notna(temp), temp, modis)
+            elif mode == "modis":
+                # Fallback MODIS -> ASTER (never NDVI)
+                temp = np.where(pd.notna(temp), temp, aster)
+
+        return temp
 
     def _load_catalog(self) -> None:
         """Read catalog.duckdb once at stream start."""
@@ -1023,86 +321,495 @@ class StreamConfig:
                 f"Catalog not found: {cat_path}\n"
                 "Run ingest.py first to build the feature store."
             )
+        log.info("catalog: loading from %s", cat_path)
+        t0 = time.perf_counter()
         conn = duckdb.connect(str(cat_path), read_only=True)
+        log.debug("catalog: duckdb connection opened in %.3fs", time.perf_counter() - t0)
 
-        # Dataset metadata — 6 rows, fine to fetchall
+        # Dataset metadata
+        t1 = time.perf_counter()
         rows = conn.execute("SELECT * FROM dataset_metadata").fetchall()
         cols = [d[0] for d in conn.description]
         self._catalog_meta = {}
         for r in rows:
             row_dict = dict(zip(cols, r))
             self._catalog_meta[row_dict["dataset_id"]] = row_dict
+        log.debug("catalog: dataset_metadata loaded (%d datasets) in %.3fs",
+                  len(self._catalog_meta), time.perf_counter() - t1)
 
-        # Histogram config — 1 row
-        cfg_row = conn.execute(
-            "SELECT bin_edges_json FROM histogram_config WHERE dataset_id = 'lst'"
-        ).fetchone()
-        self._bin_edges = json.loads(cfg_row[0]) if cfg_row else None
+        # Histogram config - load bin edges for all dimensions (stored as VARCHAR[] arrays)
+        t1 = time.perf_counter()
+        rows = conn.execute("SELECT dataset_id, bin_edges FROM histogram_config").fetchall()
+        for dataset_id, edges_array in rows:
+            if edges_array:
+                # Parse numeric dimensions (temperature, longitude, latitude) to float
+                # Keep timestamp as strings (e.g., "2000-Q1")
+                if dataset_id in ("temperature", "longitude", "latitude"):
+                    self._bin_edges_dict[dataset_id] = [float(v) for v in edges_array]
+                else:  # timestamp or other string-based dimensions
+                    self._bin_edges_dict[dataset_id] = list(edges_array)
+        if "temperature" in self._bin_edges_dict:
+            log.debug("catalog: loaded %d temperature bins", len(self._bin_edges_dict["temperature"]))
+        if "timestamp" in self._bin_edges_dict:
+            log.debug("catalog: loaded %d timestamp bins", len(self._bin_edges_dict["timestamp"]))
+        if "longitude" in self._bin_edges_dict:
+            log.debug("catalog: loaded %d longitude bins", len(self._bin_edges_dict["longitude"]))
+        if "latitude" in self._bin_edges_dict:
+            log.debug("catalog: loaded %d latitude bins", len(self._bin_edges_dict["latitude"]))
+        log.debug("catalog: histogram_config loaded in %.3fs", time.perf_counter() - t1)
 
-        # Partition statistics — 1.2 M rows: stream with fetchmany so we
-        # never hold the full result set in memory.
-        cursor = conn.execute(
-            "SELECT partition_key, tile_id, row_count, histogram_json "
-            "FROM partition_statistics WHERE dataset_id = 'lst'"
+        # Partition list
+        t1 = time.perf_counter()
+        rows = conn.execute(
+            "SELECT DISTINCT partition_key FROM partition_statistics "
+            "WHERE dataset_id = 'lst' ORDER BY partition_key"
+        ).fetchall()
+        self._partition_keys = [r[0] for r in rows]
+        log.debug("catalog: %d distinct partition_keys loaded in %.3fs",
+                  len(self._partition_keys), time.perf_counter() - t1)
+
+        # Keep the connection open - _select_partitions may query it
+        self._catalog_conn = conn
+        log.info("catalog: total load time %.3fs", time.perf_counter() - t0)
+
+    def _build_poly_rasters(
+        self,
+        registry: "FeatureRegistry",
+        lst_conn: duckdb.DuckDBPyConnection,
+        partitions: List[Tuple[str, float]],
+    ) -> Optional["_PolyRaster"]:
+        """
+        Precompute polygon-fraction features (Urban Atlas, WIS) onto a regular
+        lon/lat grid and wire the result into every registered descriptor that
+        carries a _raster_ref.
+
+        Algorithm
+        ---------
+        1.  Query the bounding box of all selected partitions from the LST
+            table (MIN/MAX longitude and latitude in one DuckDB pass — fast
+            thanks to zone-map pruning on the sorted columns).
+
+        2.  Construct a _PolyRaster grid at self.raster_resolution_m spacing,
+            with a 1-cell border pad to avoid edge effects when LST pixels
+            land on the boundary.
+
+        3.  For each unique (luc_code/attr_val, radius_m, ua_year) combination
+            found in the registered descriptors, iterate every grid point and
+            call the exact same _ua_fetch_candidates + _ua_compute_fraction
+            pipeline used by the live batch path.  This guarantees correctness:
+            the precomputed value is identical to what the live path would
+            return for a query issued from that coordinate.
+
+        4.  Attach the completed raster to each descriptor's _raster_ref cell.
+
+        Returns the shared _PolyRaster, or None if precomputation is disabled
+        (raster_resolution_m == 0) or no raster-capable descriptors exist.
+        """
+        if self.raster_resolution_m <= 0:
+            log.info("raster: precomputation disabled (raster_resolution_m=0)")
+            return None
+
+        raster_descs = [
+            d for d in registry._descriptors
+            if hasattr(d, "_raster_ref")
+        ]
+        if not raster_descs:
+            log.info("raster: no raster-capable descriptors registered — skipping")
+            return None
+
+        # ---- Step 1: bounding box of selected partitions ----
+        pk_list = ", ".join(f"'{pk}'" for pk in [p[0] for p in partitions])
+        t0 = time.perf_counter()
+        row = lst_conn.execute(f"""
+            SELECT
+                MIN(longitude) AS lon_min,
+                MAX(longitude) AS lon_max,
+                MIN(latitude)  AS lat_min,
+                MAX(latitude)  AS lat_max
+            FROM lst
+            WHERE partition_key IN ({pk_list})
+        """).fetchone()
+        if row is None or row[0] is None:
+            log.warning("raster: could not determine LST bounding box — skipping precomputation")
+            return None
+
+        lon_min, lon_max, lat_min, lat_max = row
+        log.info(
+            "raster: LST bbox lon=[%.4f, %.4f] lat=[%.4f, %.4f] "
+            "(%.3fs, %d partitions)",
+            lon_min, lon_max, lat_min, lat_max,
+            time.perf_counter() - t0, len(partitions),
         )
-        self._partition_stats = []
-        while True:
-            batch = cursor.fetchmany(50_000)
-            if not batch:
+
+        # ---- Step 2: build grid ----
+        res_m    = self.raster_resolution_m
+        step_lon = res_m * _LON_DEG_PER_M
+        step_lat = res_m * _LAT_DEG_PER_M
+        pad      = 1   # 1 cell border
+
+        lon0  = lon_min - pad * step_lon
+        lat0  = lat_min - pad * step_lat
+        n_lon = int(math.ceil((lon_max - lon_min) / step_lon)) + 2 * pad + 1
+        n_lat = int(math.ceil((lat_max - lat_min) / step_lat)) + 2 * pad + 1
+
+        raster = _PolyRaster(
+            lon0=lon0, lat0=lat0,
+            step_lon=step_lon, step_lat=step_lat,
+            n_lon=n_lon, n_lat=n_lat,
+            resolution_m=res_m,
+        )
+        raster.log_summary()
+
+        # ---- Step 3: identify unique (spec) combinations ----
+        ua_specs:  Dict[Tuple, List] = {}
+        wis_specs: Dict[Tuple, List] = {}
+
+        for desc in raster_descs:
+            if desc._raster_type == "ua":
+                key = (desc._luc_code, desc._radius_m, desc._ua_year)
+                ua_specs.setdefault(key, []).append(desc)
+            elif desc._raster_type == "wis":
+                key = (desc._attr_col, desc._attr_val, desc._radius_m)
+                wis_specs.setdefault(key, []).append(desc)
+
+        # Open SpatiaLite for polygon fetching
+        db = sqlite3.connect(str(self.prepared / "spatial.db"))
+        db.enable_load_extension(True)
+        for lib in ["mod_spatialite", "mod_spatialite.so",
+                    "mod_spatialite.dylib",
+                    "/usr/lib/x86_64-linux-gnu/mod_spatialite.so"]:
+            try:
+                db.load_extension(lib)
                 break
-            for r in batch:
-                self._partition_stats.append({
-                    "partition_key": r[0],
-                    "tile_id":       r[1],
-                    "row_count":     r[2],
-                    "histogram":     json.loads(r[3]) if r[3] else None,
-                })
-        conn.close()
+            except sqlite3.OperationalError:
+                continue
+
+        total_specs   = len(ua_specs) + len(wis_specs)
+        total_cells   = n_lon * n_lat
+        t_raster_start = time.perf_counter()
+
+        log.info(
+            "raster: precomputing %d UA spec(s) + %d WIS spec(s) "
+            "over %d x %d = %d grid cells at %.0f m resolution",
+            len(ua_specs), len(wis_specs), n_lon, n_lat, total_cells, res_m,
+        )
+
+        # ---- UA layers ----
+        ua_years_to_compute: Dict[Tuple[str, float], List[Optional[int]]] = {}
+        for (luc_code, radius_m, ua_year), _ in ua_specs.items():
+            if ua_year is None:
+                years = list(_PolyRaster.UA_YEARS)
+            else:
+                years = [ua_year]
+            ua_years_to_compute[(luc_code, radius_m)] = years
+
+        ua_layer_list = []
+        for (luc_code, radius_m), years in ua_years_to_compute.items():
+            for y in years:
+                ua_layer_list.append((luc_code, radius_m, y))
+
+        wis_layer_list = [(ac, av, rm) for (ac, av, rm) in wis_specs]
+
+        all_layers = (
+            [("ua", x) for x in ua_layer_list] +
+            [("wis", x) for x in wis_layer_list]
+        )
+
+        with tqdm(total=len(all_layers), desc="Raster precompute",
+                  unit="layer", position=0, dynamic_ncols=True) as layer_bar:
+            for layer_type, spec in all_layers:
+                if layer_type == "ua":
+                    luc_code, radius_m, year = spec
+                    layer_key = f"{luc_code}:{year}"
+                    arr = raster.add_layer(layer_key)
+                    t_layer = time.perf_counter()
+
+                    dlat_r = radius_m * _LAT_DEG_PER_M
+                    dlon_r = radius_m * _LON_DEG_PER_M
+                    all_blobs = _ua_fetch_all_in_bbox(
+                        db, luc_code, year,
+                        raster.grid_lon(0) - dlon_r, raster.grid_lat(0) - dlat_r,
+                        raster.grid_lon(n_lon - 1) + dlon_r,
+                        raster.grid_lat(n_lat - 1) + dlat_r,
+                    )
+                    log.info("raster: UA layer '%s' — %d polygons in bbox",
+                             layer_key, len(all_blobs))
+
+                    n_nonzero = _rasterise_layer(
+                        arr, raster, all_blobs, radius_m,
+                        desc=f"  UA {luc_code} {year}",
+                    )
+                    raster._coverage[layer_key] = n_nonzero
+                    elapsed = time.perf_counter() - t_layer
+                    log.info(
+                        "raster: UA layer '%s' (r=%.0fm) done — "
+                        "%d x %d cells, %d non-zero, %.1fs (%.0f cells/s)",
+                        layer_key, radius_m, n_lon, n_lat, n_nonzero, elapsed,
+                        (n_lon * n_lat) / elapsed if elapsed > 0 else 0,
+                    )
+                    layer_bar.update(1)
+
+                elif layer_type == "wis":
+                    attr_col, attr_val, radius_m = spec
+                    layer_key = f"wis:{attr_val}"
+                    arr = raster.add_layer(layer_key)
+                    t_layer = time.perf_counter()
+
+                    dlat_r = radius_m * _LAT_DEG_PER_M
+                    dlon_r = radius_m * _LON_DEG_PER_M
+                    all_blobs = _wis_fetch_all_in_bbox(
+                        db, attr_col, attr_val,
+                        raster.grid_lon(0) - dlon_r, raster.grid_lat(0) - dlat_r,
+                        raster.grid_lon(n_lon - 1) + dlon_r,
+                        raster.grid_lat(n_lat - 1) + dlat_r,
+                    )
+                    log.info("raster: WIS layer '%s' — %d polygons in bbox",
+                             layer_key, len(all_blobs))
+
+                    n_nonzero = _rasterise_layer(
+                        arr, raster, all_blobs, radius_m,
+                        desc=f"  WIS {attr_val}",
+                    )
+                    raster._coverage[layer_key] = n_nonzero
+                    elapsed = time.perf_counter() - t_layer
+                    log.info(
+                        "raster: WIS layer '%s' (r=%.0fm) done — "
+                        "%d x %d cells, %d non-zero, %.1fs (%.0f cells/s)",
+                        layer_key, radius_m, n_lon, n_lat, n_nonzero, elapsed,
+                        (n_lon * n_lat) / elapsed if elapsed > 0 else 0,
+                    )
+                    layer_bar.update(1)
+
+        db.close()
+
+        total_elapsed = time.perf_counter() - t_raster_start
+        log.info(
+            "raster: precomputation complete — %d layers, %d total cells, "
+            "%.1fs total (%.0f cells/s per layer avg)",
+            len(all_layers), total_cells * len(all_layers),
+            total_elapsed,
+            (total_cells * len(all_layers)) / total_elapsed if total_elapsed > 0 else 0,
+        )
+        raster.log_summary()
+
+        # ---- Step 4: wire raster into all descriptor _raster_ref cells ----
+        for desc in raster_descs:
+            desc._raster_ref[0] = raster
+            log.debug("raster: wired into descriptor '%s'", desc.name)
+
+        return raster
 
     def _select_partitions(self) -> List[Tuple[str, float]]:
         """
         Return list of (partition_key, weight) sorted by weight descending.
 
-        Weight is 1.0 for all partitions when no distribution is set.
-        Partitions with weight 0 are excluded.
+        When no distribution is set: all partition_keys with weight 1.0.
+        When a distribution is set: score each partition using the selected
+        dimensions (temperature, timestamp, coordinates). Score is computed
+        inside DuckDB as a product of dimension weights.
         """
-        stats = self._partition_stats or []
+        all_keys = getattr(self, "_partition_keys", [])
 
-        # Apply partition_keys filter
         if self._partitions:
-            pk_set = set(self._partitions)
-            stats  = [s for s in stats if s["partition_key"] in pk_set]
+            pk_set   = set(self._partitions)
+            all_keys = [pk for pk in all_keys if pk in pk_set]
 
-        if not stats:
+        if not all_keys:
             return []
 
-        if self._distribution is None or self._bin_edges is None:
-            # All partitions with equal weight, deduplicated by partition_key
-            seen = {}
-            for s in stats:
-                pk = s["partition_key"]
-                if pk not in seen:
-                    seen[pk] = 1.0
-            return sorted(seen.items())
+        if self._distribution is None or not self._distribution.dimensions:
+            return [(pk, 1.0) for pk in sorted(all_keys)]
 
-        # Weighted by distribution match
-        pk_weights: Dict[str, float] = {}
-        for s in stats:
-            pk  = s["partition_key"]
-            h   = s["histogram"]
-            if h is None:
-                continue
-            counts = h.get("counts", [])
-            w = self._distribution.partition_weight(counts, self._bin_edges)
-            pk_weights[pk] = pk_weights.get(pk, 0.0) + w
+        # Build SQL to score partitions on requested dimensions
+        pk_filter = ", ".join(f"'{pk}'" for pk in all_keys)
+        dimensions_to_score = list(self._distribution.dimensions.keys())
 
-        result = [(pk, w) for pk, w in pk_weights.items() if w > 0.0]
-        return sorted(result, key=lambda x: -x[1])   # highest weight first
+        # Build SELECT clause to extract histogram arrays (stored as BIGINT[])
+        select_cols = ["partition_key"]
+        if "temperature" in dimensions_to_score:
+            select_cols.append(
+                "CAST(histogram_counts AS DOUBLE[]) AS temp_counts"
+            )
+        if "timestamp" in dimensions_to_score:
+            select_cols.append(
+                "CAST(timestamp_histogram_counts AS DOUBLE[]) AS ts_counts"
+            )
+        if "longitude" in dimensions_to_score:
+            select_cols.append(
+                "CAST(longitude_histogram_counts AS DOUBLE[]) AS lon_counts"
+            )
+        if "latitude" in dimensions_to_score:
+            select_cols.append(
+                "CAST(latitude_histogram_counts AS DOUBLE[]) AS lat_counts"
+            )
+
+        select_clause = ", ".join(select_cols)
+
+        # Build WHERE clause to ensure all requested histogram arrays are present
+        where_clauses = ["dataset_id = 'lst'", f"partition_key IN ({pk_filter})"]
+        if "temperature" in dimensions_to_score:
+            where_clauses.append("histogram_counts IS NOT NULL")
+        if "timestamp" in dimensions_to_score:
+            where_clauses.append("timestamp_histogram_counts IS NOT NULL")
+        if "longitude" in dimensions_to_score:
+            where_clauses.append("longitude_histogram_counts IS NOT NULL")
+        if "latitude" in dimensions_to_score:
+            where_clauses.append("latitude_histogram_counts IS NOT NULL")
+
+        where_clause = " AND ".join(where_clauses)
+
+        # Build weight expressions for each dimension
+        weight_exprs = []
+
+        if "temperature" in dimensions_to_score:
+            temp_dim = self._distribution.dimensions["temperature"]
+            temp_edges = temp_dim.bin_edges
+            n_bins = len(temp_edges) - 1
+            target_vec = [0.0] * n_bins
+            for edge, desired_prop in temp_dim.target.items():
+                bin_idx = min(
+                    range(n_bins),
+                    key=lambda i: abs(temp_edges[i] - edge),
+                )
+                target_vec[bin_idx] += desired_prop
+            target_json = json.dumps(target_vec)
+            weight_exprs.append(f"""
+                list_aggregate(
+                    list_transform(
+                        generate_series(0, len(temp_counts) - 1),
+                        i -> CASE
+                            WHEN list_sum(temp_counts) = 0 THEN 0.0
+                            ELSE least(
+                                temp_counts[i + 1]::DOUBLE / list_sum(temp_counts),
+                                ({target_json}::DOUBLE[])[i + 1]
+                            )
+                        END
+                    ),
+                    'sum'
+                )
+            """)
+
+        if "timestamp" in dimensions_to_score:
+            ts_dim = self._distribution.dimensions["timestamp"]
+            ts_edges = ts_dim.bin_edges
+            n_bins = len(ts_edges) - 1
+            target_vec = [0.0] * n_bins
+            for edge, desired_prop in ts_dim.target.items():
+                bin_idx = min(
+                    range(n_bins),
+                    key=lambda i: abs(ts_edges[i] - edge),
+                )
+                target_vec[bin_idx] += desired_prop
+            target_json = json.dumps(target_vec)
+            weight_exprs.append(f"""
+                list_aggregate(
+                    list_transform(
+                        generate_series(0, len(ts_counts) - 1),
+                        i -> CASE
+                            WHEN list_sum(ts_counts) = 0 THEN 0.0
+                            ELSE least(
+                                ts_counts[i + 1]::DOUBLE / list_sum(ts_counts),
+                                ({target_json}::DOUBLE[])[i + 1]
+                            )
+                        END
+                    ),
+                    'sum'
+                )
+            """)
+
+        if "longitude" in dimensions_to_score:
+            lon_dim = self._distribution.dimensions["longitude"]
+            lon_edges = lon_dim.bin_edges
+            n_bins = len(lon_edges) - 1
+            target_vec = [0.0] * n_bins
+            for edge, desired_prop in lon_dim.target.items():
+                bin_idx = min(
+                    range(n_bins),
+                    key=lambda i: abs(lon_edges[i] - edge),
+                )
+                target_vec[bin_idx] += desired_prop
+            target_json = json.dumps(target_vec)
+            weight_exprs.append(f"""
+                list_aggregate(
+                    list_transform(
+                        generate_series(0, len(lon_counts) - 1),
+                        i -> CASE
+                            WHEN list_sum(lon_counts) = 0 THEN 0.0
+                            ELSE least(
+                                lon_counts[i + 1]::DOUBLE / list_sum(lon_counts),
+                                ({target_json}::DOUBLE[])[i + 1]
+                            )
+                        END
+                    ),
+                    'sum'
+                )
+            """)
+
+        if "latitude" in dimensions_to_score:
+            lat_dim = self._distribution.dimensions["latitude"]
+            lat_edges = lat_dim.bin_edges
+            n_bins = len(lat_edges) - 1
+            target_vec = [0.0] * n_bins
+            for edge, desired_prop in lat_dim.target.items():
+                bin_idx = min(
+                    range(n_bins),
+                    key=lambda i: abs(lat_edges[i] - edge),
+                )
+                target_vec[bin_idx] += desired_prop
+            target_json = json.dumps(target_vec)
+            weight_exprs.append(f"""
+                list_aggregate(
+                    list_transform(
+                        generate_series(0, len(lat_counts) - 1),
+                        i -> CASE
+                            WHEN list_sum(lat_counts) = 0 THEN 0.0
+                            ELSE least(
+                                lat_counts[i + 1]::DOUBLE / list_sum(lat_counts),
+                                ({target_json}::DOUBLE[])[i + 1]
+                            )
+                        END
+                    ),
+                    'sum'
+                )
+            """)
+
+        # Build the product of weights (one weight expression per dimension)
+        if len(weight_exprs) == 1:
+            weight_expr = weight_exprs[0]
+        else:
+            # Product of all dimension weights
+            weight_expr = " * ".join(f"({expr})" for expr in weight_exprs)
+
+        sql = f"""
+            WITH parsed AS (
+                SELECT {select_clause}
+                FROM partition_statistics
+                WHERE {where_clause}
+            ),
+            scored AS (
+                SELECT
+                    partition_key,
+                    {weight_expr} AS weight
+                FROM parsed
+            )
+            SELECT partition_key, weight
+            FROM scored
+            WHERE weight > 0
+            ORDER BY weight DESC
+        """
+
+        t0 = time.perf_counter()
+        rows = self._catalog_conn.execute(sql).fetchall()
+        log.info("catalog: partition scoring done in %.3fs (%d partitions) "
+                 "using dimensions: %s",
+                 time.perf_counter() - t0, len(rows), dimensions_to_score)
+        return [(r[0], r[1]) for r in rows]
 
     def stream(
         self,
         registry: Optional[FeatureRegistry] = None,
         batch_size: Optional[int] = None,
+        max_rows: Optional[int] = None,
     ) -> Generator[pd.DataFrame, None, None]:
         """
         Stream LST data with engineered features, one DataFrame batch at a time.
@@ -1112,89 +819,270 @@ class StreamConfig:
         registry   : FeatureRegistry with registered features.
                      Pass None (or an empty registry) to stream raw LST only.
         batch_size : override the batch_size set in __init__.
+        max_rows   : stop after yielding this many rows total.  Applies both
+                     to full-dataset streaming and distribution-weighted runs.
+                     The last batch may be smaller than batch_size.
 
         Yields
         ------
-        pd.DataFrame, shape (batch_size, 9 + n_features)
-        Columns: longitude, latitude, temperature, emissivity, landsat_id,
+        pd.DataFrame, shape (<= batch_size, 10 + n_features)
+        Columns: longitude, latitude, temperature,
+                 aster_lst, modis_lst, ndvi,
                  image_id, timestamp, partition_key, tile_id,
                  [feature columns...]
+        Note: 'temperature' is resolved from aster_lst/modis_lst/ndvi using
+              lst_emissivity_mode and lst_null_handling settings.
 
-        Memory model
-        ------------
-        The full LST table is never loaded.  DuckDB cursor.fetchmany() pulls
-        batch_size rows per iteration.  Batch features issue one SQL query per
-        feature per batch.  Custom (row-level) features accumulate into
-        pre-allocated column arrays, not list-of-dicts.
+        Progress
+        --------
+        Two tqdm bars are shown:
+          Outer - one tick per partition (247 total), postfix shows rows
+                  yielded, throughput, and current partition key.
+          Inner - one tick per batch within the current partition, postfix
+                  shows per-feature timing once the first batch completes.
+
+        Early stopping
+        --------------
+        Stops immediately once max_rows is reached.  When a distribution
+        target is set, partitions are ordered by weight descending so the
+        highest-value data comes first - set max_rows to collect a well-
+        distributed sample without streaming the full dataset.
         """
         if registry is None:
             registry = FeatureRegistry()
 
         bs = batch_size or self.batch_size
+        log.info("stream: starting - batch_size=%d, max_rows=%s, features=%d "
+                 "(batch=%d row=%d)",
+                 bs, max_rows, len(registry),
+                 len(registry._batch_descriptors),
+                 len(registry._row_descriptors))
+
+        t0 = time.perf_counter()
         self._load_catalog()
         partitions = self._select_partitions()
+        log.info("stream: catalog ready, %d partitions selected in %.3fs",
+                 len(partitions), time.perf_counter() - t0)
 
         if not partitions:
+            log.warning("stream: no partitions selected - nothing to stream")
             return
 
         lst_meta = self._catalog_meta.get("lst", {})
         lst_db   = self.prepared / lst_meta.get("db_file", "lst.duckdb")
 
+        log.info("stream: opening LST database %s", lst_db)
+        t0 = time.perf_counter()
         lst_conn      = duckdb.connect(str(lst_db), read_only=True)
+        log.info("stream: LST database opened in %.3fs", time.perf_counter() - t0)
+
+        log.debug("stream: initialising feature Connections object")
         feature_conns = Connections(self.prepared, self._catalog_meta)
+
+        # Force SpatiaLite to initialise before any Shapely geometry call.
+        log.info("stream: pre-loading SpatiaLite connection ...")
+        t0 = time.perf_counter()
+        try:
+            feature_conns.spatialite("spatial.db")
+            log.info("stream: SpatiaLite connection ready in %.3fs",
+                     time.perf_counter() - t0)
+        except Exception as exc:
+            log.error("stream: SpatiaLite failed to load - %s", exc, exc_info=True)
+            raise
+
+        # ---- Precompute polygon rasters (UA + WIS) before the batch loop ----
+        if registry is not None:
+            self._build_poly_rasters(registry, lst_conn, partitions)
 
         has_batch = len(registry._batch_descriptors) > 0
         has_row   = len(registry._row_descriptors)   > 0
 
+        # Session-level counters
+        session_rows   = 0
+        session_t0     = time.perf_counter()
+        stop_early     = False
+
         try:
-            for partition_key, _weight in tqdm(
-                partitions, desc="Streaming partitions", unit="partition"
-            ):
+            part_bar = tqdm(
+                partitions,
+                desc="Partitions",
+                unit="partition",
+                position=0,
+                dynamic_ncols=True,
+            )
+            for part_idx, (partition_key, weight) in enumerate(part_bar):
+                if stop_early:
+                    break
+
+                part_t0   = time.perf_counter()
+                part_rows = 0
+
+                part_bar.set_postfix({
+                    "pk":      partition_key,
+                    "weight":  f"{weight:.3f}",
+                    "yielded": f"{session_rows:,}",
+                }, refresh=True)
+
+                log.info("partition %s [%d/%d] (w=%.3f): executing LST cursor",
+                         partition_key, part_idx + 1, len(partitions), weight)
+
+                # Estimate batch count BEFORE opening the streaming cursor.
+                # Executing any query on lst_conn while the streaming cursor is
+                # open replaces the active DuckDB result set, causing fetchmany
+                # to return [] immediately.  The COUNT must complete first.
+                est_batches = None
+                try:
+                    n_part = lst_conn.execute(
+                        "SELECT COUNT(*) FROM lst WHERE partition_key = ?",
+                        [partition_key]
+                    ).fetchone()[0]
+                    est_batches = max(1, (n_part + bs - 1) // bs)
+                    log.debug("partition %s: ~%d rows, ~%d batches",
+                              partition_key, n_part, est_batches)
+                except Exception:
+                    pass
+
                 cursor = lst_conn.execute(
-                    "SELECT longitude, latitude, temperature, emissivity, "
-                    "       landsat_id, image_id, timestamp, partition_key, tile_id "
+                    "SELECT longitude, latitude, aster_lst, modis_lst, ndvi, "
+                    "       image_id, timestamp, partition_key, tile_id "
                     "FROM lst "
-                    "WHERE partition_key = ? "
-                    "ORDER BY tile_id",
+                    "WHERE partition_key = ?",
                     [partition_key],
                 )
+                log.debug("partition %s: cursor ready in %.3fs",
+                          partition_key, time.perf_counter() - part_t0)
 
-                while True:
-                    raw_rows = cursor.fetchmany(bs)
-                    if not raw_rows:
-                        break
+                batch_num = 0
+                first_batch_feat_time: Optional[float] = None
 
-                    base_df = pd.DataFrame(raw_rows, columns=FeatureRow._fields)
+                batch_bar = tqdm(
+                    total=est_batches,
+                    desc=f"  {partition_key}",
+                    unit="batch",
+                    position=1,
+                    leave=False,
+                    dynamic_ncols=True,
+                )
 
-                    if not has_batch and not has_row:
-                        yield base_df
-                        continue
+                try:
+                    while True:
+                        # Respect max_rows before fetching
+                        if max_rows is not None:
+                            remaining = max_rows - session_rows
+                            if remaining <= 0:
+                                stop_early = True
+                                break
+                            fetch_n = min(bs, remaining)
+                        else:
+                            fetch_n = bs
 
-                    parts = [base_df]
+                        t_fetch = time.perf_counter()
+                        raw_rows = cursor.fetchmany(fetch_n)
+                        fetch_ms = (time.perf_counter() - t_fetch) * 1000
+                        log.debug("partition %s batch %d: fetchmany(%d) -> %d rows "
+                                  "in %.0fms",
+                                  partition_key, batch_num, fetch_n,
+                                  len(raw_rows), fetch_ms)
 
-                    # Batch features: one SQL query per feature per batch
-                    if has_batch:
-                        batch_feat_df = registry.compute_batch_features(
-                            base_df, feature_conns
-                        )
-                        if not batch_feat_df.empty:
-                            parts.append(
-                                batch_feat_df.reset_index(drop=True)
-                            )
+                        if not raw_rows:
+                            break
 
-                    # Row features: custom callables, pre-allocated arrays
-                    if has_row:
-                        row_feat_df = registry.compute_row_features(
-                            raw_rows, feature_conns
-                        )
-                        if not row_feat_df.empty:
-                            parts.append(row_feat_df)
+                        base_df = pd.DataFrame(raw_rows, columns=FeatureRow._fields)
 
-                    yield pd.concat(parts, axis=1)
+                        # Resolve LST temperature from 3 emissivity sources based on mode
+                        temperature = self._resolve_lst_temperature(base_df)
+                        base_df.insert(2, "temperature", temperature)
+
+                        if not has_batch and not has_row:
+                            yield base_df
+                            n_yielded = len(raw_rows)
+                        else:
+                            out_cols_data: Dict[str, np.ndarray] = {
+                                col: base_df[col].to_numpy()
+                                for col in base_df.columns
+                            }
+
+                            t_feat = time.perf_counter()
+
+                            if has_batch:
+                                batch_feat_df = registry.compute_batch_features(
+                                    base_df, feature_conns
+                                )
+                                for col in batch_feat_df.columns:
+                                    out_cols_data[col] = batch_feat_df[col].to_numpy()
+
+                            if has_row:
+                                row_feat_df = registry.compute_row_features(
+                                    raw_rows, feature_conns
+                                )
+                                for col in row_feat_df.columns:
+                                    out_cols_data[col] = row_feat_df[col].to_numpy()
+
+                            feat_elapsed = time.perf_counter() - t_feat
+                            if first_batch_feat_time is None:
+                                first_batch_feat_time = feat_elapsed
+                                log.info("partition %s batch %d: first feature batch "
+                                         "in %.2fs - cols: %s",
+                                         partition_key, batch_num, feat_elapsed,
+                                         [c for c in out_cols_data
+                                          if c not in FeatureRow._fields])
+
+                            result_df = pd.DataFrame(out_cols_data)
+                            yield result_df
+                            n_yielded = len(result_df)
+
+                        session_rows += n_yielded
+                        part_rows    += n_yielded
+                        batch_num    += 1
+
+                        elapsed    = time.perf_counter() - session_t0
+                        throughput = session_rows / elapsed if elapsed > 0 else 0
+
+                        batch_bar.update(1)
+                        batch_bar.set_postfix({
+                            "rows":   f"{part_rows:,}",
+                            "r/s":    f"{throughput:,.0f}",
+                            "feat_s": f"{first_batch_feat_time:.1f}s"
+                                      if first_batch_feat_time else "...",
+                        }, refresh=False)
+                        part_bar.set_postfix({
+                            "pk":      partition_key,
+                            "weight":  f"{weight:.3f}",
+                            "yielded": f"{session_rows:,}",
+                            "r/s":     f"{throughput:,.0f}",
+                        }, refresh=False)
+
+                        if max_rows is not None and session_rows >= max_rows:
+                            stop_early = True
+                            break
+
+                finally:
+                    batch_bar.close()
+
+                part_elapsed = time.perf_counter() - part_t0
+                part_rps     = part_rows / part_elapsed if part_elapsed > 0 else 0
+                log.info("partition %s: done - %d rows in %.1fs (%.0f rows/s)",
+                         partition_key, part_rows, part_elapsed, part_rps)
+
+                if stop_early:
+                    log.info("stream: early stop after %d rows (max_rows=%s)",
+                             session_rows, max_rows)
+                    break
 
         finally:
+            part_bar.close()
+            session_elapsed = time.perf_counter() - session_t0
+            session_rps     = session_rows / session_elapsed if session_elapsed > 0 else 0
+            log.info("stream: session complete - %d rows in %.1fs (%.0f rows/s)",
+                     session_rows, session_elapsed, session_rps)
             lst_conn.close()
             feature_conns.close()
+            if hasattr(self, "_catalog_conn") and self._catalog_conn:
+                try:
+                    self._catalog_conn.close()
+                except Exception:
+                    pass
+                self._catalog_conn = None
 
     def to_dataframe(
         self,
@@ -1211,17 +1099,11 @@ class StreamConfig:
         Parameters
         ----------
         max_rows : stop after this many rows (useful for exploration).
+                   Passed directly to stream() so early stopping happens
+                   at fetch time, not after feature computation.
         """
         chunks = []
-        total  = 0
-        for batch_df in self.stream(registry, batch_size=batch_size):
-            if max_rows is not None:
-                remaining = max_rows - total
-                if remaining <= 0:
-                    break
-                batch_df = batch_df.iloc[:remaining]
+        for batch_df in self.stream(registry, batch_size=batch_size,
+                                    max_rows=max_rows):
             chunks.append(batch_df)
-            total += len(batch_df)
-            if max_rows is not None and total >= max_rows:
-                break
         return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()

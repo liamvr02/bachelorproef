@@ -10,6 +10,8 @@ install sqlite and spatialite, there's many ways to do this but it is recommende
 - conda (with ´--channel conda-forge´)
 - OSGeo4W (GUI)
 
+Make sure spatialite is in ´PATH´
+
 install [astral uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ```bash
