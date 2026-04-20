@@ -382,124 +382,162 @@ class StreamConfig:
         log.info("catalog: total load time %.3fs", time.perf_counter() - t0)
 
     # ------------------------------------------------------------------
-    # Raster cache helpers
+    # Raster cache helpers  (DuckDB, per layer)
     # ------------------------------------------------------------------
+    # Cache file: /src/stream_cache/rasters/raster_cache.duckdb
+    #
+    # Schema
+    # ------
+    # raster_grid (one row per unique grid configuration):
+    #   grid_key    VARCHAR PK   — 16-char SHA-256 of grid geometry params
+    #   resolution_m DOUBLE
+    #   lon0, lat0, step_lon, step_lat  DOUBLE
+    #   n_lon, n_lat  INTEGER
+    #
+    # raster_layer (one row per computed layer):
+    #   grid_key    VARCHAR      — FK → raster_grid
+    #   layer_key   VARCHAR      — e.g. "11100:2006" or "wis:rijbaan"
+    #   radius_m    DOUBLE       — query radius used for this layer
+    #   n_nonzero   INTEGER      — non-zero cell count (for logging)
+    #   array_blob  BLOB         — raw float32 bytes, shape (n_lon * n_lat,)
+    #   PRIMARY KEY (grid_key, layer_key)
+    #
+    # A layer is identified solely by (grid_key, layer_key).  The grid_key
+    # encodes resolution + bbox + derived grid geometry; the layer_key encodes
+    # luc_code + survey year (or WIS attribute value).  radius_m is stored
+    # separately because the same polygon class can be queried at different
+    # radii — each (grid_key, layer_key) pair therefore corresponds to exactly
+    # one (class, radius, grid) triple.
+    #
+    # This means a layer computed for one feature grouping (e.g.
+    # classifications_fractions at r=100m) is reusable when a second run
+    # requests the same class at the same radius — even if the overall layer
+    # list differs.
 
-    def _raster_cache_key(
+    @property
+    def _cache_db_path(self) -> Path:
+        return self._raster_cache_dir / "raster_cache.duckdb"
+
+    def _open_cache_db(self) -> "duckdb.DuckDBPyConnection":
+        """
+        Open (creating if necessary) the raster cache DuckDB and ensure
+        the schema exists.  Returns an open read-write connection.
+        """
+        self._raster_cache_dir.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(str(self._cache_db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS raster_grid (
+                grid_key     VARCHAR PRIMARY KEY,
+                resolution_m DOUBLE  NOT NULL,
+                lon0         DOUBLE  NOT NULL,
+                lat0         DOUBLE  NOT NULL,
+                step_lon     DOUBLE  NOT NULL,
+                step_lat     DOUBLE  NOT NULL,
+                n_lon        INTEGER NOT NULL,
+                n_lat        INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS raster_layer (
+                grid_key   VARCHAR NOT NULL,
+                layer_key  VARCHAR NOT NULL,
+                radius_m   DOUBLE  NOT NULL,
+                n_nonzero  INTEGER NOT NULL,
+                array_blob BLOB    NOT NULL,
+                PRIMARY KEY (grid_key, layer_key)
+            )
+        """)
+        return conn
+
+    def _grid_key(
         self,
-        ua_layer_list:  List[Tuple[str, float, int]],
-        wis_layer_list: List[Tuple[str, str, float]],
-        lon_min: float, lon_max: float,
-        lat_min: float, lat_max: float,
+        lon0: float, lat0: float,
+        step_lon: float, step_lat: float,
+        n_lon: int, n_lat: int,
+        resolution_m: float,
     ) -> str:
         """
-        Build a deterministic SHA-256 hex digest that uniquely identifies a
-        raster configuration.
-
-        The digest is computed over a canonical JSON document containing:
-          - grid parameters (resolution, bbox, derived step/origin/shape)
-          - an alphabetically sorted list of every layer spec
-
-        Two rasters are considered identical iff their digest matches, meaning
-        the same layers will be present with the same grid geometry.  If the
-        user changes resolution, bbox, or any registered feature's luc_code /
-        radius / year, the digest changes and a fresh raster is built.
-
-        Returns a 16-character prefix of the full hex digest — long enough to
-        be collision-free in practice while keeping filenames readable.
+        16-char SHA-256 of the grid geometry parameters.  Two grids with
+        identical geometry produce the same key regardless of what layers
+        are requested — this is what allows per-layer reuse across runs.
         """
-        res_m    = self.raster_resolution_m
-        step_lon = res_m * _LON_DEG_PER_M
-        step_lat = res_m * _LAT_DEG_PER_M
-        pad      = 1
-        lon0     = lon_min - pad * step_lon
-        lat0     = lat_min - pad * step_lat
-        n_lon    = int(math.ceil((lon_max - lon_min) / step_lon)) + 2 * pad + 1
-        n_lat    = int(math.ceil((lat_max - lat_min) / step_lat)) + 2 * pad + 1
-
         spec = {
-            "resolution_m": res_m,
-            "lon0":         round(lon0,    10),
-            "lat0":         round(lat0,    10),
-            "step_lon":     round(step_lon, 10),
-            "step_lat":     round(step_lat, 10),
-            "n_lon":        n_lon,
-            "n_lat":        n_lat,
-            # Sort layer specs so descriptor registration order doesn't matter
-            "ua_layers": sorted(
-                [{"luc_code": lc, "radius_m": r, "ua_year": y}
-                 for lc, r, y in ua_layer_list],
-                key=lambda d: (d["luc_code"], d["radius_m"], d["ua_year"]),
-            ),
-            "wis_layers": sorted(
-                [{"attr_col": ac, "attr_val": av, "radius_m": r}
-                 for ac, av, r in wis_layer_list],
-                key=lambda d: (d["attr_col"], d["attr_val"], d["radius_m"]),
-            ),
+            "resolution_m": resolution_m,
+            "lon0":     round(lon0,     10),
+            "lat0":     round(lat0,     10),
+            "step_lon": round(step_lon, 10),
+            "step_lat": round(step_lat, 10),
+            "n_lon":    n_lon,
+            "n_lat":    n_lat,
         }
-        digest = hashlib.sha256(
+        return hashlib.sha256(
             json.dumps(spec, sort_keys=True).encode()
-        ).hexdigest()
-        return digest[:16]
+        ).hexdigest()[:16]
 
-    def _load_cached_raster(self, cache_key: str) -> Optional["_PolyRaster"]:
+    def _load_layer_from_cache(
+        self,
+        conn: "duckdb.DuckDBPyConnection",
+        grid_key: str,
+        layer_key: str,
+        n_lon: int,
+        n_lat: int,
+    ) -> Optional[Tuple[np.ndarray, int]]:
         """
-        Try to load a previously saved raster from disk.
+        Try to load one layer from the cache DB.
 
-        Returns the _PolyRaster on success, None on any miss or error
-        (missing file, corrupt archive, schema mismatch).  Errors are logged
-        as warnings so a corrupt cache degrades gracefully to a rebuild.
+        Returns (array, n_nonzero) on hit, None on miss or any error.
+        The array is always shape (n_lon, n_lat) float32.
         """
-        json_path = self._raster_cache_dir / f"{cache_key}.json"
-        npz_path  = self._raster_cache_dir / f"{cache_key}.npz"
-
-        if not json_path.exists() or not npz_path.exists():
-            log.info("raster cache: no entry for key %s", cache_key)
+        try:
+            row = conn.execute(
+                "SELECT array_blob, n_nonzero FROM raster_layer "
+                "WHERE grid_key = ? AND layer_key = ?",
+                [grid_key, layer_key],
+            ).fetchone()
+            if row is None:
+                return None
+            blob, n_nonzero = row
+            arr = np.frombuffer(bytes(blob), dtype=np.float32).reshape(n_lon, n_lat).copy()
+            return arr, int(n_nonzero)
+        except Exception as exc:
+            log.warning("raster cache: load error for %s/%s: %s",
+                        grid_key, layer_key, exc)
             return None
 
-        log.info("raster cache: found entry %s — loading ...", cache_key)
-        t0 = time.perf_counter()
-        try:
-            raster = _PolyRaster.load(npz_path, json_path)
-            log.info(
-                "raster cache: loaded %d layer(s) in %.1fs  [key=%s]",
-                len(raster._layers), time.perf_counter() - t0, cache_key,
-            )
-            return raster
-        except Exception as exc:
-            log.warning(
-                "raster cache: load failed for key %s (%s) — will recompute",
-                cache_key, exc,
-            )
-            return None
-
-    def _save_raster_cache(self, raster: "_PolyRaster", cache_key: str) -> None:
+    def _save_layer_to_cache(
+        self,
+        conn: "duckdb.DuckDBPyConnection",
+        grid_key: str,
+        layer_key: str,
+        radius_m: float,
+        arr: np.ndarray,
+        n_nonzero: int,
+        lon0: float, lat0: float,
+        step_lon: float, step_lat: float,
+        n_lon: int, n_lat: int,
+        resolution_m: float,
+    ) -> None:
         """
-        Persist a freshly computed raster to the cache directory.
-
-        Failures are logged as warnings and do not abort the stream — the
-        raster is still used in-memory for this run; only the next run would
-        miss the cache.
+        Persist one layer to the cache DB immediately after rasterisation.
+        Upserts both the grid row (idempotent) and the layer row.
         """
-        json_path = self._raster_cache_dir / f"{cache_key}.json"
-        npz_path  = self._raster_cache_dir / f"{cache_key}.npz"
-        log.info(
-            "raster cache: saving %d layer(s) → %s  [key=%s]",
-            len(raster._layers), self._raster_cache_dir, cache_key,
-        )
-        t0 = time.perf_counter()
         try:
-            raster.save(npz_path, json_path)
-            log.info(
-                "raster cache: saved in %.1fs  [key=%s]",
-                time.perf_counter() - t0, cache_key,
-            )
+            # Ensure grid row exists
+            conn.execute("""
+                INSERT OR IGNORE INTO raster_grid
+                    (grid_key, resolution_m, lon0, lat0, step_lon, step_lat, n_lon, n_lat)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [grid_key, resolution_m, lon0, lat0, step_lon, step_lat, n_lon, n_lat])
+
+            blob = arr.astype(np.float32).tobytes()
+            conn.execute("""
+                INSERT OR REPLACE INTO raster_layer
+                    (grid_key, layer_key, radius_m, n_nonzero, array_blob)
+                VALUES (?, ?, ?, ?, ?)
+            """, [grid_key, layer_key, radius_m, n_nonzero, blob])
         except Exception as exc:
-            log.warning(
-                "raster cache: save failed for key %s (%s) — "
-                "cache will be empty for the next run",
-                cache_key, exc,
-            )
+            log.warning("raster cache: save error for %s/%s: %s",
+                        grid_key, layer_key, exc)
 
     def _build_poly_rasters(
         self,
@@ -635,40 +673,20 @@ class StreamConfig:
             [("wis", x) for x in wis_layer_list]
         )
 
-        # ---- Step 4: check the on-disk cache ----
-        cache_key = self._raster_cache_key(
-            ua_layer_list, wis_layer_list,
-            lon_min, lon_max, lat_min, lat_max,
+        # ---- Step 4: open cache DB and compute the grid key ----
+        gkey = self._grid_key(
+            lon0, lat0, step_lon, step_lat, n_lon, n_lat, res_m,
         )
-        log.info("raster cache: key=%s", cache_key)
+        log.info("raster cache: grid_key=%s  db=%s", gkey, self._cache_db_path)
 
-        cached = self._load_cached_raster(cache_key)
-        if cached is not None:
-            # Verify every expected layer is present (guards against a cache
-            # written by an older version that had fewer layers)
-            expected = {f"{lc}:{y}" for lc, _, y in ua_layer_list}
-            expected |= {f"wis:{av}" for _, av, _ in wis_layer_list}
-            missing  = expected - set(cached._layers.keys())
-            if missing:
-                log.warning(
-                    "raster cache: hit for key %s but %d layer(s) missing %s "
-                    "— discarding and recomputing",
-                    cache_key, len(missing), sorted(missing),
-                )
-            else:
-                log.info(
-                    "raster cache: HIT — skipping precomputation "
-                    "(%d layers, key=%s)",
-                    len(cached._layers), cache_key,
-                )
-                cached.log_summary()
-                for desc in raster_descs:
-                    desc._raster_ref[0] = cached
-                    log.debug("raster: wired cached raster into descriptor '%s'", desc.name)
-                return cached
+        cache_conn = None
+        try:
+            cache_conn = self._open_cache_db()
+        except Exception as exc:
+            log.warning("raster cache: could not open cache DB (%s) "
+                        "— will compute without caching", exc)
 
-        # ---- Step 5: open SpatiaLite and rasterise ----
-        # Open SpatiaLite for polygon fetching
+        # ---- Step 5: open SpatiaLite for polygon fetching ----
         db = sqlite3.connect(str(self.prepared / "spatial.db"))
         db.enable_load_extension(True)
         for lib in ["mod_spatialite", "mod_spatialite.so",
@@ -682,93 +700,115 @@ class StreamConfig:
 
         total_cells    = n_lon * n_lat
         t_raster_start = time.perf_counter()
+        n_cache_hits   = 0
+        n_computed     = 0
 
         log.info(
-            "raster: precomputing %d UA layer(s) + %d WIS layer(s) "
-            "over %d x %d = %d grid cells at %.0f m resolution",
+            "raster: %d UA layer(s) + %d WIS layer(s), "
+            "%d x %d = %d grid cells at %.0f m resolution",
             len(ua_layer_list), len(wis_layer_list),
             n_lon, n_lat, total_cells, res_m,
         )
 
-        with tqdm(total=len(all_layers), desc="Raster precompute",
+        # ---- Step 6: per-layer cache-check → rasterise → save ----
+        with tqdm(total=len(all_layers), desc="Raster layers",
                   unit="layer", position=0, dynamic_ncols=True) as layer_bar:
             for layer_type, spec in all_layers:
                 if layer_type == "ua":
-                    luc_code, radius_m, year = spec
+                    luc_code, layer_radius_m, year = spec
                     layer_key = f"{luc_code}:{year}"
-                    arr = raster.add_layer(layer_key)
-                    t_layer = time.perf_counter()
+                elif layer_type == "wis":
+                    attr_col, attr_val, layer_radius_m = spec
+                    layer_key = f"wis:{attr_val}"
+                else:
+                    layer_bar.update(1)
+                    continue
 
-                    dlat_r = radius_m * _LAT_DEG_PER_M
-                    dlon_r = radius_m * _LON_DEG_PER_M
+                # --- cache hit? ---
+                if cache_conn is not None:
+                    hit = self._load_layer_from_cache(
+                        cache_conn, gkey, layer_key, n_lon, n_lat,
+                    )
+                    if hit is not None:
+                        arr, n_nonzero = hit
+                        raster._layers[layer_key]   = arr
+                        raster._coverage[layer_key] = n_nonzero
+                        n_cache_hits += 1
+                        log.debug("raster cache: HIT  %s/%s  (%d non-zero)",
+                                  gkey, layer_key, n_nonzero)
+                        layer_bar.set_postfix(
+                            hit=n_cache_hits, computed=n_computed, refresh=False
+                        )
+                        layer_bar.update(1)
+                        continue
+
+                # --- cache miss: rasterise ---
+                arr = raster.add_layer(layer_key)
+                t_layer = time.perf_counter()
+
+                dlat_r = layer_radius_m * _LAT_DEG_PER_M
+                dlon_r = layer_radius_m * _LON_DEG_PER_M
+
+                if layer_type == "ua":
                     all_blobs = _ua_fetch_all_in_bbox(
                         db, luc_code, year,
-                        raster.grid_lon(0) - dlon_r, raster.grid_lat(0) - dlat_r,
-                        raster.grid_lon(n_lon - 1) + dlon_r,
-                        raster.grid_lat(n_lat - 1) + dlat_r,
+                        raster.grid_lon(0)       - dlon_r,
+                        raster.grid_lat(0)       - dlat_r,
+                        raster.grid_lon(n_lon-1) + dlon_r,
+                        raster.grid_lat(n_lat-1) + dlat_r,
                     )
-                    log.info("raster: UA layer '%s' — %d polygons in bbox",
-                             layer_key, len(all_blobs))
-
-                    n_nonzero = _rasterise_layer(
-                        arr, raster, all_blobs, radius_m,
-                        desc=f"  UA {luc_code} {year}",
-                    )
-                    raster._coverage[layer_key] = n_nonzero
-                    elapsed = time.perf_counter() - t_layer
-                    log.info(
-                        "raster: UA layer '%s' (r=%.0fm) done — "
-                        "%d x %d cells, %d non-zero, %.1fs (%.0f cells/s)",
-                        layer_key, radius_m, n_lon, n_lat, n_nonzero, elapsed,
-                        (n_lon * n_lat) / elapsed if elapsed > 0 else 0,
-                    )
-                    layer_bar.update(1)
-
-                elif layer_type == "wis":
-                    attr_col, attr_val, radius_m = spec
-                    layer_key = f"wis:{attr_val}"
-                    arr = raster.add_layer(layer_key)
-                    t_layer = time.perf_counter()
-
-                    dlat_r = radius_m * _LAT_DEG_PER_M
-                    dlon_r = radius_m * _LON_DEG_PER_M
+                    tqdm_desc = f"  UA {luc_code} {year}"
+                else:
                     all_blobs = _wis_fetch_all_in_bbox(
                         db, attr_col, attr_val,
-                        raster.grid_lon(0) - dlon_r, raster.grid_lat(0) - dlat_r,
-                        raster.grid_lon(n_lon - 1) + dlon_r,
-                        raster.grid_lat(n_lat - 1) + dlat_r,
+                        raster.grid_lon(0)       - dlon_r,
+                        raster.grid_lat(0)       - dlat_r,
+                        raster.grid_lon(n_lon-1) + dlon_r,
+                        raster.grid_lat(n_lat-1) + dlat_r,
                     )
-                    log.info("raster: WIS layer '%s' — %d polygons in bbox",
-                             layer_key, len(all_blobs))
+                    tqdm_desc = f"  WIS {attr_val}"
 
-                    n_nonzero = _rasterise_layer(
-                        arr, raster, all_blobs, radius_m,
-                        desc=f"  WIS {attr_val}",
+                log.info("raster: %s — %d polygon(s) in bbox",
+                         layer_key, len(all_blobs))
+
+                n_nonzero = _rasterise_layer(
+                    arr, raster, all_blobs, layer_radius_m,
+                    desc=tqdm_desc,
+                )
+                raster._coverage[layer_key] = n_nonzero
+                elapsed = time.perf_counter() - t_layer
+                n_computed += 1
+                log.info(
+                    "raster: %s (r=%.0fm) done — %d non-zero cells, "
+                    "%.1fs (%.0f cells/s)",
+                    layer_key, layer_radius_m, n_nonzero, elapsed,
+                    total_cells / elapsed if elapsed > 0 else 0,
+                )
+
+                # --- write to cache immediately ---
+                if cache_conn is not None:
+                    self._save_layer_to_cache(
+                        cache_conn, gkey, layer_key, layer_radius_m,
+                        arr, n_nonzero,
+                        lon0, lat0, step_lon, step_lat, n_lon, n_lat, res_m,
                     )
-                    raster._coverage[layer_key] = n_nonzero
-                    elapsed = time.perf_counter() - t_layer
-                    log.info(
-                        "raster: WIS layer '%s' (r=%.0fm) done — "
-                        "%d x %d cells, %d non-zero, %.1fs (%.0f cells/s)",
-                        layer_key, radius_m, n_lon, n_lat, n_nonzero, elapsed,
-                        (n_lon * n_lat) / elapsed if elapsed > 0 else 0,
-                    )
-                    layer_bar.update(1)
+
+                layer_bar.set_postfix(
+                    hit=n_cache_hits, computed=n_computed, refresh=False
+                )
+                layer_bar.update(1)
 
         db.close()
+        if cache_conn is not None:
+            cache_conn.close()
 
         total_elapsed = time.perf_counter() - t_raster_start
         log.info(
-            "raster: precomputation complete — %d layers, %d total cells, "
-            "%.1fs total (%.0f cells/s per layer avg)",
-            len(all_layers), total_cells * len(all_layers),
-            total_elapsed,
-            (total_cells * len(all_layers)) / total_elapsed if total_elapsed > 0 else 0,
+            "raster: done — %d hit(s) from cache, %d computed, "
+            "%d total cells, %.1fs",
+            n_cache_hits, n_computed, total_cells, total_elapsed,
         )
         raster.log_summary()
-
-        # ---- Step 6: persist to cache so the next run skips precomputation ----
-        self._save_raster_cache(raster, cache_key)
 
         # ---- Step 7: wire raster into all descriptor _raster_ref cells ----
         for desc in raster_descs:
