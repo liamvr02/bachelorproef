@@ -99,7 +99,7 @@ def get_lst_urls(
         current_start = range_start
 
         tqdm.write(
-            f"Landsat {landsat['id']} | Range: {range_start.date()} → {range_end.date()} | "
+            f"Landsat {landsat['id']} | Range: {range_start.date()} -> {range_end.date()} | "
             f"Emissivities: {landsat.get('emissivities', [])}"
         )
 

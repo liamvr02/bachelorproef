@@ -10,9 +10,11 @@ src/downloads/DHM[1,2]_extracted/*
 
 src/**/*.csv
 src/prepared_stream_data/*
+src/stream_cache/*
 
 **/__pycache__
 
+.claude
 
 .venv
 

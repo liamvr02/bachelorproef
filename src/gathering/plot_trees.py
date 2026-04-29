@@ -9,10 +9,10 @@ from datetime import date
 from ghent_polygon import get_ghent_convex_hull, get_ghent_outers
 from gather_trees import get_trees_csv as get_trees
 
-OUTPUT_FILE = Path(__file__).parent.absolute() / f"plot_trees.result.png"
+OUTPUT_FILE = Path(__file__).parent.absolute() / f"plot_trees.with_planting_year.result.png"
 
 # Load CSV
-df = get_trees()
+df = get_trees()[['geo_point_2d', 'aanlegjaar']].dropna()
 
 # Extract coordinates
 df[['lat', 'lon']] = df['geo_point_2d'].str.split(',', expand=True).astype(float)

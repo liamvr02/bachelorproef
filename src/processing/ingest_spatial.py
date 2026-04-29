@@ -2,8 +2,8 @@
 ingest/ingest_spatial.py
 ========================
 Ingestors for polygon datasets stored in SpatiaLite:
-  - Urban Atlas  →  spatial.db :: urban_atlas
-  - WIS          →  spatial.db :: wis
+  - Urban Atlas  ->  spatial.db :: urban_atlas
+  - WIS          ->  spatial.db :: wis
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ def _normalise_luc(gdf: gpd.GeoDataFrame, candidates: list[str]) -> gpd.GeoDataF
     non_geom = [c for c in gdf.columns if c != "geometry"]
     log.warning(
         "No luc_code candidate matched %s.  Available columns: %s.  "
-        "Using '%s' as fallback — add the correct name to UA_SOURCES[year]['luc_candidates'].",
+        "Using '%s' as fallback - add the correct name to UA_SOURCES[year]['luc_candidates'].",
         candidates, list(gdf.columns), non_geom[0] if non_geom else "none",
     )
     if non_geom:
@@ -96,7 +96,7 @@ def ingest_urban_atlas(downloads: Path, output: Path) -> int:
     """
     ua_root = downloads / "urban_atlas_extracted"
     if not ua_root.exists():
-        log.warning("Urban Atlas source directory not found: %s — skipping", ua_root)
+        log.warning("Urban Atlas source directory not found: %s - skipping", ua_root)
         return 0
 
     conn = open_spatialite(output / "spatial.db")
@@ -119,7 +119,7 @@ def ingest_urban_atlas(downloads: Path, output: Path) -> int:
     for year in sorted(UA_SOURCES.keys()):
         source = _find_ua_file(year, ua_root)
         if source is None:
-            log.warning("Urban Atlas %d: no file found — skipping", year)
+            log.warning("Urban Atlas %d: no file found - skipping", year)
             continue
 
         log.info("Urban Atlas %d: loading %s ...", year, source.name)
@@ -133,7 +133,7 @@ def ingest_urban_atlas(downloads: Path, output: Path) -> int:
         gdf          = _normalise_luc(gdf, UA_SOURCES[year]["luc_candidates"])
 
         if "luc_code" not in gdf.columns:
-            log.error("Urban Atlas %d: cannot identify luc_code column — skipping", year)
+            log.error("Urban Atlas %d: cannot identify luc_code column - skipping", year)
             continue
 
         gdf["_geom_wkt"] = gdf.geometry.apply(_to_multipolygon_wkt)
@@ -165,6 +165,10 @@ def ingest_urban_atlas(downloads: Path, output: Path) -> int:
 
         log.info("Urban Atlas %d: %d polygons", year, len(gdf))
 
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ua_luc_code ON urban_atlas(luc_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ua_year     ON urban_atlas(ua_year)")
+    conn.commit()
+
     conn.close()
     return total
 
@@ -192,7 +196,7 @@ def ingest_wis(downloads: Path, output: Path) -> int:
     """
     geojson_path = downloads / "wis" / "wis.geojson"
     if not geojson_path.exists():
-        log.warning("WIS GeoJSON not found: %s — skipping", geojson_path)
+        log.warning("WIS GeoJSON not found: %s - skipping", geojson_path)
         return 0
 
     log.info("WIS: loading %s ...", geojson_path.name)
@@ -245,6 +249,10 @@ def ingest_wis(downloads: Path, output: Path) -> int:
         """, rows)
         conn.commit()
         total += len(rows)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wis_bestemming     ON wis(bestemming)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wis_materiaalsoort ON wis(materiaalsoort)")
+    conn.commit()
 
     conn.close()
     log.info("WIS: %d polygons ingested", total)

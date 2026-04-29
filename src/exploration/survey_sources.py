@@ -253,17 +253,17 @@ def survey_lst(downloads: Path) -> None:
             parse_failures += 1
 
     print(f"  Parse failures: {parse_failures}")
-    print(f"\n  Emissivity values (split[1]) — {len(emissivity_vals)} unique:")
+    print(f"\n  Emissivity values (split[1]) - {len(emissivity_vals)} unique:")
     for v, cnt in sorted(emissivity_vals.items(), key=lambda x: -x[1]):
         print(f"    {v:<20} {cnt:>6,} folders")
-    print(f"\n  Product values (regex group) — {len(product_vals)} unique:")
+    print(f"\n  Product values (regex group) - {len(product_vals)} unique:")
     for v, cnt in sorted(product_vals.items(), key=lambda x: -x[1]):
         print(f"    {v:<20} {cnt:>6,} folders")
     print(f"\n  Sample folder names:")
     for name in sorted(folders)[:5]:
         parts = name.split("_")
         print(f"    {name}")
-        print(f"      → split: {parts}")
+        print(f"      -> split: {parts}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

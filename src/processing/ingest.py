@@ -1,15 +1,14 @@
 """
-ingest.py  —  /src/processing/ingest.py
+ingest.py  -  /src/processing/ingest.py
 ============================================================
-Spatiotemporal feature-store ingestion pipeline — entry point.
+Spatiotemporal feature-store ingestion pipeline - entry point.
 
 Reads all raw source data from a downloads directory and writes the
 embedded databases that the streaming stage reads:
 
     prepared_stream_data/
         lst.duckdb          LST temperature + NDVI  (DuckDB)
-        dhm1.duckdb         DHM1 elevation points    (DuckDB)
-        dhm2.duckdb         DHM2 elevation points    (DuckDB)
+        dhm.duckdb          DHM1 + DHM2 elevation points, one table keyed by dhm_year (DuckDB)
         trees.duckdb        Tree inventory           (DuckDB)
         spatial.db          Urban Atlas + WIS polygons (SpatiaLite)
         catalog.duckdb      Dataset registry + histograms (DuckDB)
@@ -30,7 +29,7 @@ Adding a new dataset
     1. Write an ingest_<n>() function in an ingest/ingest_<n>.py module.
     2. Add an entry to ingest/config.py :: DATASET_REGISTRY.
     3. Call the function in _run_ingestion() below.
-    The streaming layer discovers everything from catalog.duckdb — no changes
+    The streaming layer discovers everything from catalog.duckdb - no changes
     needed there.
 
 Requirements
@@ -118,7 +117,7 @@ def _run_ingestion(
         else:
             has_data = _spatialite_has_rows(spec["table"])
         if has_data:
-            log.info("skip-existing: %s already has data — skipping", dataset_id)
+            log.info("skip-existing: %s already has data - skipping", dataset_id)
             return True
         return False
 
@@ -132,37 +131,36 @@ def _run_ingestion(
     # Note: NDVI is now integrated into the LST table (3-column schema).
     if any(d in only for d in ("lst", "ndvi")):
         if not _skip("lst"):
-            _banner("LST (with ASTER/MODIS/NDVI)  →  lst.duckdb")
+            _banner("LST (with ASTER/MODIS/NDVI)  ->  lst.duckdb")
             n = ingest_lst(downloads, output)
             log.info("LST total rows: %d", n)
         if "lst"  in only: processed.append("lst")
         if "ndvi" in only: processed.append("ndvi")
 
-    if any(d in only for d in ("dhm1", "dhm2")):
-        if not (_skip("dhm1") and _skip("dhm2")):
-            _banner("DHM1 + DHM2  →  dhm1.duckdb / dhm2.duckdb")
+    if "dhm" in only:
+        if not _skip("dhm"):
+            _banner("DHM1 + DHM2  ->  dhm.duckdb (table `dhm`, keyed by dhm_year)")
             n = ingest_dhm(downloads, output)
             log.info("DHM total rows: %d", n)
-        if "dhm1" in only: processed.append("dhm1")
-        if "dhm2" in only: processed.append("dhm2")
+        processed.append("dhm")
 
     if "trees" in only:
         if not _skip("trees"):
-            _banner("Trees  →  trees.duckdb")
+            _banner("Trees  ->  trees.duckdb")
             n = ingest_trees(downloads, output)
             log.info("Trees rows: %d", n)
         processed.append("trees")
 
     if "urban_atlas" in only:
         if not _skip("urban_atlas"):
-            _banner("Urban Atlas  →  spatial.db")
+            _banner("Urban Atlas  ->  spatial.db")
             n = ingest_urban_atlas(downloads, output)
             log.info("Urban Atlas polygon rows: %d", n)
         processed.append("urban_atlas")
 
     if "wis" in only:
         if not _skip("wis"):
-            _banner("WIS  →  spatial.db")
+            _banner("WIS  ->  spatial.db")
             n = ingest_wis(downloads, output)
             log.info("WIS polygon rows: %d", n)
         processed.append("wis")

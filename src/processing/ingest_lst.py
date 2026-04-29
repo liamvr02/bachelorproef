@@ -2,6 +2,28 @@
 ingest/ingest_lst.py
 ====================
 Ingestor: LST + NDVI GeoTIFFs  →  lst.duckdb
+
+Schema (lst table)
+------------------
+longitude        DOUBLE
+latitude         DOUBLE
+aster_lst        FLOAT        — ASTER-emissivity LST (nullable)
+modis_lst        FLOAT        — MODIS-emissivity LST (nullable)
+ndvi             FLOAT        — NDVI vegetation index (nullable)
+image_id         VARCHAR
+timestamp        VARCHAR      — ISO-8601 "YYYY-MM-DDTHH:MM:SS"
+partition_key    VARCHAR      — "YYYY-MM"
+tile_id          VARCHAR      — H3 cell at resolution 9
+year             INTEGER      — calendar year  (e.g. 2015)
+month_of_year    INTEGER      — month 1–12
+day_of_month     INTEGER      — day within month 1–31
+day_of_year      INTEGER      — day within year 1–366
+hour_of_day      FLOAT        — fractional UTC hour  (e.g. 10.5 = 10h 30m)
+
+The five time-component columns are derived once at ingest time so that
+catalog histogramming and streaming partition scoring never need to parse
+the timestamp string at runtime.  They expose each temporal granularity
+as an independent, targetable dimension.
 """
 
 from __future__ import annotations
@@ -9,23 +31,19 @@ from __future__ import annotations
 import logging
 import re
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from tqdm import tqdm
 
-from config import (
-    APPEND_BATCH_ROWS,
-    LST_COLUMNS,
-)
+from config import APPEND_BATCH_ROWS, LST_COLUMNS
 from db import open_duckdb
 from spatial import (
     add_h3,
-    filter_by_polygon,
     get_ghent_convex_hull_polygon,
     get_ghent_exact_polygon,
-    iter_raster_blocks,
     iter_raster_blocks_masked,
 )
 
@@ -34,7 +52,8 @@ log = logging.getLogger("ingest.lst")
 # ============================================================
 # LST folder-name parser
 # ============================================================
-# Format: L5_ASTER_20000301_20010301_LT51980242000222FUI00_20000809_101119
+# Folder format: L5_ASTER_20000301_20010301_LT51980242000222FUI00_20000809_101119
+#                                                                  ↑date↑  ↑time↑
 _FOLDER_RE = re.compile(
     r"^(?P<sat>L\w+)_(?P<product>[A-Z]+)_\d{8}_\d{8}_"
     r"(?P<prod_id>\w+)_(?P<date>\d{8})_(?P<time>\d{6})$"
@@ -42,26 +61,56 @@ _FOLDER_RE = re.compile(
 
 
 def _parse_lst_folder(name: str) -> Optional[dict]:
-    """Parse an LST/NDVI folder name into metadata fields."""
-    parts = name.split("_")
-    if len(parts) < 7:
-        return None
-    emissivity = parts[1]
+    """
+    Parse an LST/NDVI folder name into metadata fields.
 
+    All five time-component fields are derived here so that downstream code
+    never needs to re-parse the timestamp string:
+
+        year          — calendar year
+        month_of_year — month 1–12
+        day_of_month  — day within month 1–31
+        day_of_year   — day within year 1–366
+        hour_of_day   — fractional hour (HH + MM/60 + SS/3600)
+
+    Returns None when the folder name does not match the expected pattern.
+    """
     m = _FOLDER_RE.match(name)
     if not m:
         return None
-    prod_id   = m.group("prod_id")
-    d, t      = m.group("date"), m.group("time")
-    timestamp = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}"
+
+    prod_id = m.group("prod_id")
+    d, t    = m.group("date"), m.group("time")
+
+    # Parse date and time components
+    yy   = int(d[0:4])
+    mo   = int(d[4:6])
+    dd   = int(d[6:8])
+    hh   = int(t[0:2])
+    mm   = int(t[2:4])
+    ss   = int(t[4:6])
+
+    # ISO timestamp string kept for display and legacy temporal queries
+    timestamp = f"{yy:04d}-{mo:02d}-{dd:02d}T{hh:02d}:{mm:02d}:{ss:02d}"
+
+    # day_of_year via datetime (handles leap years correctly)
+    doy = datetime(yy, mo, dd).timetuple().tm_yday
+
+    # Fractional hour: minutes and seconds expressed as a decimal
+    hour_of_day = hh + mm / 60.0 + ss / 3600.0
+
     return {
         "satellite":     m.group("sat"),
-        "product":       m.group("product").upper(),   # ASTER | MODIS | NDVI
-        "landsat_id":    m.group("sat"),
-        "emissivity":    emissivity,
+        "product":       m.group("product").upper(),  # ASTER | MODIS | NDVI
         "image_id":      prod_id,
         "timestamp":     timestamp,
-        "partition_key": timestamp[:7],                # YYYY-MM
+        "partition_key": timestamp[:7],               # YYYY-MM
+        # Time components
+        "year":          yy,
+        "month_of_year": mo,
+        "day_of_month":  dd,
+        "day_of_year":   doy,
+        "hour_of_day":   hour_of_day,
     }
 
 
@@ -73,20 +122,20 @@ def ingest_lst(downloads: Path, output: Path) -> int:
     """
     Convert all LST and NDVI TIF folders into a single unified DuckDB table.
 
-    Schema (lst):  longitude, latitude, aster_lst, modis_lst, ndvi,
-                   image_id, timestamp, partition_key, tile_id
+    Processing strategy
+    -------------------
+    1.  Discover all sub-folders under downloads/lst_tifs/ and parse their
+        metadata via _parse_lst_folder().
+    2.  Group folders by image_id (one image = one acquisition scene).
+    3.  For each image_id read ASTER, MODIS, and NDVI TIFs independently,
+        clip each to the Ghent polygon, then outer-join on (lon, lat).
+    4.  Tag every row with image_id, timestamp, partition_key, tile_id, and
+        the five pre-computed time components before appending to DuckDB.
+    5.  After all images are processed, sort by (partition_key, tile_id) for
+        efficient zone-map pruning during streaming queries.
 
-    Processing strategy:
-    - Group TIFs by image_id
-    - For each image_id, collect all emissivity variants (ASTER, MODIS, NDVI)
-    - Read all variants in parallel, merge on (lon, lat) coordinates
-    - Create unified rows with aster_lst, modis_lst, ndvi columns (nulls allowed)
-    - Track processed TIFs to avoid duplicate work
-
-    Batches of APPEND_BATCH_ROWS are sorted by (partition_key, tile_id)
-    before appending so row-groups are locally sorted.  A final ORDER BY
-    produces a globally sorted replacement table; DuckDB spills to
-    temp_directory so it cannot OOM.
+    Batches of APPEND_BATCH_ROWS are flushed incrementally to keep memory
+    usage bounded regardless of dataset size.
     """
     tif_root = downloads / "lst_tifs"
     if not tif_root.exists():
@@ -106,35 +155,36 @@ def ingest_lst(downloads: Path, output: Path) -> int:
     conn.execute("DROP TABLE IF EXISTS lst")
     conn.execute("""
         CREATE TABLE lst (
-            longitude     DOUBLE,
-            latitude      DOUBLE,
-            aster_lst     FLOAT,
-            modis_lst     FLOAT,
-            ndvi          FLOAT,
-            image_id      VARCHAR,
-            timestamp     VARCHAR,
-            partition_key VARCHAR,
-            tile_id       VARCHAR
+            longitude        DOUBLE,
+            latitude         DOUBLE,
+            aster_lst        FLOAT,
+            modis_lst        FLOAT,
+            ndvi             FLOAT,
+            image_id         VARCHAR,
+            timestamp        VARCHAR,
+            partition_key    VARCHAR,
+            tile_id          VARCHAR,
+            year             INTEGER,
+            month_of_year    INTEGER,
+            day_of_month     INTEGER,
+            day_of_year      INTEGER,
+            hour_of_day      FLOAT
         )
     """)
 
-    # ========== Collect and group folders by image_id ==========
+    # ---- Collect and group folders by image_id -------------------------
     folders = sorted(p for p in tif_root.iterdir() if p.is_dir())
     tqdm.write(f"LST/NDVI: {len(folders)} source folders found")
 
-    # Parse metadata for all folders
-    folder_meta: dict[str, dict] = {}  # folder_name -> metadata
-    image_id_groups: dict[str, list[Path]] = {}  # image_id -> list of folder paths
+    folder_meta: dict[str, dict]           = {}
+    image_id_groups: dict[str, list[Path]] = {}
 
     for folder in folders:
         meta = _parse_lst_folder(folder.name)
         if meta is None:
             continue
         folder_meta[folder.name] = meta
-        image_id = meta["image_id"]
-        if image_id not in image_id_groups:
-            image_id_groups[image_id] = []
-        image_id_groups[image_id].append(folder)
+        image_id_groups.setdefault(meta["image_id"], []).append(folder)
 
     tqdm.write(f"  Grouped into {len(image_id_groups)} unique image_ids")
 
@@ -143,153 +193,145 @@ def ingest_lst(downloads: Path, output: Path) -> int:
     ghent_convex = get_ghent_convex_hull_polygon()
     log.info("LST: Polygon filters loaded")
 
-    lst_rows = skipped = 0
+    lst_rows          = 0
+    skipped           = 0
     lst_buffer: list[pd.DataFrame] = []
-    lst_buf_rows = 0
-    processed_folders = set()
+    lst_buf_rows      = 0
+    processed_folders: set = set()
 
-    def _flush(buffer: list[pd.DataFrame], table: str,
-               cols: list[str], sort_cols: list[str]) -> None:
+    def _flush(buffer: list[pd.DataFrame]) -> None:
+        """Sort a batch by (partition_key, tile_id) and append to DuckDB."""
         if not buffer:
             return
-        # Suppress FutureWarning about all-NA columns in concat (occurs with outer joins)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=FutureWarning,
-                                  message=".*empty or all-NA entries.*")
+                                    message=".*empty or all-NA entries.*")
             batch = pd.concat(buffer, ignore_index=True)
         buffer.clear()
-        batch.sort_values(sort_cols, inplace=True, ignore_index=True)
-        conn.append(table, batch[cols])
+        batch.sort_values(["partition_key", "tile_id"], inplace=True, ignore_index=True)
+        conn.append("lst", batch[LST_COLUMNS])
 
-    # ========== Process by image_id groups ==========
+    # ---- Process each image_id group -----------------------------------
     image_id_list = sorted(image_id_groups.keys())
     for image_id_idx, image_id in enumerate(
         tqdm(image_id_list, desc="Image ID groups", unit="group", smoothing=0.1)
     ):
         folders_for_id = image_id_groups[image_id]
 
-        # Skip if all folders already processed
         if all(f in processed_folders for f in folders_for_id):
             continue
 
-        # Collect active folders (not yet processed)
         active_folders = [f for f in folders_for_id if f not in processed_folders]
+        by_product: dict[str, Path] = {
+            folder_meta[f.name]["product"]: f for f in active_folders
+        }
 
-        # Group active folders by emissivity product
-        by_product: dict[str, Path] = {}  # product -> folder
-        for folder in active_folders:
-            meta = folder_meta[folder.name]
-            product = meta["product"]
-            by_product[product] = folder
+        # ---- Read raster data for each emissivity product --------------
+        data_by_product: dict[str, pd.DataFrame] = {}
 
-        # ========== Read all emissivity variants for this image_id ==========
-        data_by_product: dict[str, pd.DataFrame] = {}  # product -> DataFrame
-
-        # Read LST products (ASTER, MODIS)
-        for product in ["ASTER", "MODIS"]:
+        # ASTER and MODIS — clipped to the exact Ghent boundary
+        for product in ("ASTER", "MODIS"):
             if product not in by_product:
                 continue
-            folder = by_product[product]
-            tif_files = list(folder.glob("*.tif"))
+            tif_files = list(by_product[product].glob("*.tif"))
             if not tif_files:
                 skipped += 1
                 continue
-
-            tif_path = tif_files[0]
-            chunks = []
-            for chunk in iter_raster_blocks_masked(tif_path, ghent_exact, skip_zeros=True):
-                if len(chunk) == 0:
-                    continue
-                chunks.append(chunk)
-
+            chunks = [
+                chunk for chunk in iter_raster_blocks_masked(
+                    tif_files[0], ghent_exact, skip_zeros=True
+                )
+                if len(chunk) > 0
+            ]
             if chunks:
                 df = pd.concat(chunks, ignore_index=True)
                 df = add_h3(df)
                 df = df.rename(columns={"value": f"{product.lower()}_lst"})
                 data_by_product[product] = df
 
-        # Read NDVI (uses convex hull, not exact polygon)
+        # NDVI — clipped to convex hull to avoid boundary artefacts
         if "NDVI" in by_product:
-            folder = by_product["NDVI"]
-            tif_files = list(folder.glob("*.tif"))
+            tif_files = list(by_product["NDVI"].glob("*.tif"))
             if tif_files:
-                tif_path = tif_files[0]
                 chunks = []
-                for chunk in iter_raster_blocks_masked(tif_path, ghent_convex, skip_zeros=False):
+                for chunk in iter_raster_blocks_masked(
+                    tif_files[0], ghent_convex, skip_zeros=False
+                ):
                     if len(chunk) == 0:
                         continue
-                    # Filter out zeros (clouds)
                     chunk = chunk[chunk["value"] != 0.0].reset_index(drop=True)
-                    if len(chunk) == 0:
-                        continue
-                    chunks.append(chunk)
-
+                    if len(chunk) > 0:
+                        chunks.append(chunk)
                 if chunks:
                     df = pd.concat(chunks, ignore_index=True)
                     df = add_h3(df)
                     df = df.rename(columns={"value": "ndvi"})
                     data_by_product["NDVI"] = df
 
-        # ========== Merge data from all products ==========
         if not data_by_product:
             for folder in active_folders:
                 processed_folders.add(folder)
             continue
 
-        # Merge on (longitude, latitude) — outer join to keep all coordinates
-        merged_df = None
+        # ---- Outer-join all products on (longitude, latitude) ----------
+        merged_df: Optional[pd.DataFrame] = None
         for product, df in data_by_product.items():
             if merged_df is None:
                 merged_df = df.copy()
             else:
-                # Column name depends on product (ASTER/MODIS use "_lst" suffix, NDVI is just "ndvi")
-                value_col = f"{product.lower()}_lst" if product in ("ASTER", "MODIS") else "ndvi"
-                merge_cols = ["longitude", "latitude", value_col]
+                value_col = (
+                    f"{product.lower()}_lst" if product in ("ASTER", "MODIS") else "ndvi"
+                )
                 merged_df = merged_df.merge(
-                    df[merge_cols],
+                    df[["longitude", "latitude", value_col]],
                     on=["longitude", "latitude"],
-                    how="outer"
+                    how="outer",
                 )
 
-        # Ensure all columns exist (fill missing with None/null)
-        for col in ["aster_lst", "modis_lst", "ndvi"]:
+        # Ensure all LST value columns exist and are float
+        for col in ("aster_lst", "modis_lst", "ndvi"):
             if col not in merged_df.columns:
                 merged_df[col] = None
-            # Explicitly ensure float dtype for all LST value columns
             merged_df[col] = merged_df[col].astype("float64", errors="ignore")
 
-        # Add spatiotemp​oral columns
+        # ---- Attach spatiotemporal metadata ----------------------------
         meta = folder_meta[active_folders[0].name]
         merged_df["image_id"]      = meta["image_id"]
         merged_df["timestamp"]     = meta["timestamp"]
         merged_df["partition_key"] = meta["partition_key"]
+        # Pre-computed time components — one scalar per acquisition scene
+        merged_df["year"]          = meta["year"]
+        merged_df["month_of_year"] = meta["month_of_year"]
+        merged_df["day_of_month"]  = meta["day_of_month"]
+        merged_df["day_of_year"]   = meta["day_of_year"]
+        merged_df["hour_of_day"]   = meta["hour_of_day"]
 
-        # Buffer for batch append (suppress FutureWarning about all-NA columns in concat)
+        # ---- Buffer and flush ------------------------------------------
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, 
-                                  message=".*empty or all-NA entries.*")
+            warnings.filterwarnings("ignore", category=FutureWarning,
+                                    message=".*empty or all-NA entries.*")
             lst_buffer.append(merged_df)
         lst_buf_rows += len(merged_df)
         lst_rows     += len(merged_df)
 
         if lst_buf_rows >= APPEND_BATCH_ROWS:
-            _flush(lst_buffer, "lst", LST_COLUMNS, ["partition_key", "tile_id"])
+            _flush(lst_buffer)
             lst_buf_rows = 0
 
-        # Mark all folders for this image_id as processed
         for folder in active_folders:
             processed_folders.add(folder)
 
         if (image_id_idx + 1) % CHECKPOINT_EVERY == 0:
-            _flush(lst_buffer, "lst", LST_COLUMNS, ["partition_key", "tile_id"])
+            _flush(lst_buffer)
             lst_buf_rows = 0
             conn.execute("CHECKPOINT")
 
-    _flush(lst_buffer, "lst", LST_COLUMNS, ["partition_key", "tile_id"])
+    _flush(lst_buffer)
     conn.execute("CHECKPOINT")
 
     tqdm.write(f"LST: {lst_rows:,} unified rows | skipped: {skipped}")
 
+    # ---- Global sort for zone-map pruning ------------------------------
     tqdm.write("Sorting lst by (partition_key, tile_id) ...")
     conn.execute("""
         CREATE TABLE lst_sorted AS

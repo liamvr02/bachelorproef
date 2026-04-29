@@ -1,70 +1,119 @@
 """
 distribution.py  -  /src/stream/distribution.py
 ================================================
-Multi-dimensional distribution targeting for weighted partition sampling.
+Target distribution objects for weighted partition sampling.
 
-Supports targeting distributions for:
-  - temperature: LST temperature values in degrees C
-  - timestamp: ISO 8601 dates (YYYY-MM-DD format)
-  - longitude: WGS-84 longitudinal coordinate in degrees
-  - latitude: WGS-84 latitudinal coordinate in degrees
+Design
+------
+A DistributionTarget holds one DimensionTarget per requested dimension.
+The streaming layer scores each partition by calling partition_weight()
+with the histogram count arrays retrieved from catalog.duckdb.
+
+Extensibility
+-------------
+Any dimension name registered in config.DIMENSION_CATALOG can be targeted.
+The DistributionTarget constructor validates names against the catalog so
+typos are caught early.
+
+Uniform shorthand
+-----------------
+Passing an empty dict {} as a dimension's target is the canonical way to
+request a flat (uniform) distribution over all bins of that dimension.
+This is the correct way to express "I want even coverage across all years"
+or "I want even coverage across all hours of the day".
+
+Usage examples
+--------------
+# Even distribution across year, month, and time-of-day:
+cfg.set_distribution({
+    "year":          ({}, year_edges),
+    "month_of_year": ({}, month_edges),
+    "hour_of_day":   ({}, hour_edges),
+})
+
+# Skewed temperature, uniform time-of-day:
+cfg.set_distribution({
+    "temperature": ({20: 0.3, 25: 0.5, 30: 0.2}, temp_edges),
+    "hour_of_day": ({},                            hour_edges),
+})
+
+# Backwards-compatible simple format (temperature only, flat dict):
+cfg.set_distribution({15: 0.2, 20: 0.3, 25: 0.5})
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 class DimensionTarget:
     """
-    Target distribution for a single dimension (e.g., temperature, timestamp, location).
+    Target distribution for a single scoreable dimension.
 
     Parameters
     ----------
     dimension : str
-        Name of the dimension: "temperature", "timestamp", "longitude", or "latitude"
-    target : dict mapping bin edge to desired proportion
-        Proportions are normalised to sum to 1.
-        Example:  {15: 0.20, 20: 0.30, 25: 0.30, 30: 0.15, 35: 0.05}
-    bin_edges : list of bin lower edges (+ upper edge of last bin)
-        E.g., [-10, -8, -6, ..., 58, 60] for 2°C bins from -10 to 60°C
+        Name of the dimension.  Must match an entry in config.DIMENSION_CATALOG.
+    target : dict
+        Mapping of {bin_edge: desired_proportion}.
+        An empty dict {} requests a uniform (flat) distribution over all bins.
+        Non-empty dicts are normalised to sum to 1.0.
+    bin_edges : list
+        Ordered bin boundary values (length = n_bins + 1).
+        For numeric dimensions these are floats; for 'timestamp' they are
+        quarterly label strings ("YYYY-Q{1..4}").
     """
 
-    def __init__(
-        self,
-        dimension: str,
-        target: Dict[float, float],
-        bin_edges: List[float],
-    ):
+    def __init__(self, dimension: str, target: Dict, bin_edges: List) -> None:
         self.dimension = dimension
         self.bin_edges = bin_edges
-        total = sum(target.values())
-        self.target = {float(k): v / total for k, v in target.items()}
+        n_bins = len(bin_edges) - 1
+
+        if not target:
+            # Uniform: every bin gets equal weight
+            uniform = 1.0 / n_bins if n_bins > 0 else 0.0
+            self.target: Dict[Any, float] = {bin_edges[i]: uniform for i in range(n_bins)}
+        else:
+            total = sum(target.values())
+            self.target = {k: v / total for k, v in target.items()}
+
+    def _find_bin(self, edge_value) -> int:
+        """Return the 0-based bin index whose lower edge is closest to edge_value."""
+        n_bins = len(self.bin_edges) - 1
+        if isinstance(edge_value, str):
+            # String dimensions (timestamp): exact match with fallback to index 0
+            for i, e in enumerate(self.bin_edges[:-1]):
+                if e == edge_value:
+                    return i
+            return 0
+        # Numeric: closest lower edge
+        return min(range(n_bins), key=lambda i: abs(float(self.bin_edges[i]) - float(edge_value)))
 
     def partition_weight(self, hist_counts: List[int]) -> float:
         """
         Score this dimension's contribution to the target distribution.
 
+        The score is sum(min(actual_proportion, target_proportion)) over all
+        bins — a standard overlap metric that equals 1.0 when the partition's
+        distribution exactly matches the target, and 0.0 when there is no overlap.
+
         Parameters
         ----------
-        hist_counts : list of bin counts from the histogram
+        hist_counts : list[int]
+            Dense count array of length n_bins for this dimension.
 
         Returns
         -------
-        float in [0, 1]. Weight 0 means partition doesn't match target at all.
+        float in [0, 1].  Returns 0.0 when the partition has no rows.
         """
         total = sum(hist_counts)
         if total == 0:
             return 0.0
         score = 0.0
-        for bin_edge, desired_prop in self.target.items():
-            # Find the bin index for this edge
-            bin_idx = min(
-                range(len(self.bin_edges) - 1),
-                key=lambda i: abs(self.bin_edges[i] - bin_edge),
-            )
+        for edge_value, desired in self.target.items():
+            bin_idx     = self._find_bin(edge_value)
             actual_prop = hist_counts[bin_idx] / total
-            score += min(actual_prop, desired_prop)
+            score      += min(actual_prop, desired)
         return score
 
 
@@ -72,102 +121,96 @@ class DistributionTarget:
     """
     Multi-dimensional distribution target for weighted partition sampling.
 
-    Combines multiple dimension targets (temperature, timestamp, coordinates).
-    Partition weight is the product of weights across all dimensions.
+    The partition weight is the product of per-dimension scores.  Partitions
+    with weight 0 are skipped entirely.  Partitions are then ordered by
+    weight descending so the most valuable data is streamed first, enabling
+    early stopping (max_rows) to yield a well-distributed sample.
 
     Parameters
     ----------
-    targets : dict mapping dimension name to (target_dict, bin_edges)
-        Example:
-            {
-                "temperature": ({15: 0.2, 20: 0.3, 25: 0.3, 30: 0.2}, [-10, -8, ..., 60]),
-                "timestamp": ({"2010-01": 0.3, "2015-01": 0.4, "2020-01": 0.3},
-                              ["2000-01", "2005-01", ..., "2025-01"]),
-            }
+    targets : dict — two accepted formats:
 
-    Backwards compatibility
-    -----------------------
-    Accepts a simple dict of edge->proportion for temperature-only targeting.
-    If called with a flat dict, assumes temperature-only mode:
-        DistributionTarget({15: 0.2, 20: 0.3, 25: 0.5})
+        Multi-dimension (recommended):
+            {
+                "year":          ({},                          year_edges),
+                "month_of_year": ({},                          month_edges),
+                "hour_of_day":   ({},                          hour_edges),
+                "temperature":   ({20: 0.3, 25: 0.4, 30: 0.3}, temp_edges),
+            }
+        Each value is a (target_dict, bin_edges) tuple.
+        An empty target_dict {} means uniform over all bins.
+
+        Simple backwards-compatible (temperature only):
+            {15: 0.2, 20: 0.3, 25: 0.5}
+        Bin edges are injected later via set_temperature_bins().
+
+    valid_dimensions : set[str], optional
+        When provided, dimension names are validated against this set.
+        Pass config.DIMENSION_CATALOG.keys() from the calling layer.
     """
 
-    def __init__(self, targets: Dict):
+    def __init__(
+        self,
+        targets: Dict,
+        valid_dimensions: Optional[set] = None,
+    ) -> None:
         self.dimensions: Dict[str, DimensionTarget] = {}
+        self._valid_dimensions = valid_dimensions
 
-        # Detect simple (temperature-only) vs multi-dimension format
-        is_simple_format = (
-            targets and
-            all(isinstance(k, (int, float)) for k in targets.keys())
+        # Detect backwards-compatible flat dict (all numeric keys)
+        is_simple = bool(targets) and all(
+            isinstance(k, (int, float)) for k in targets.keys()
         )
 
-        if is_simple_format:
-            # Backwards compatibility: flat dict → temperature-only
-            # Caller must pass default bin edges via set_temperature_bins
-            self._pending_simple_target = targets
-            self._pending_temperature_bins: Optional[List[float]] = None
+        if is_simple:
+            # Temperature-only shorthand; bin edges injected later
+            self._pending_simple_target: Optional[Dict] = targets
         else:
-            # Multi-dimension format: dict of {dimension: (target_dict, bin_edges)}
-            for dimension, (target_dict, bin_edges) in targets.items():
-                self.dimensions[dimension] = DimensionTarget(
-                    dimension, target_dict, bin_edges
-                )
+            self._pending_simple_target = None
+            for dimension, value in targets.items():
+                if not (isinstance(value, (list, tuple)) and len(value) == 2):
+                    raise ValueError(
+                        f"Target for dimension '{dimension}' must be "
+                        f"(target_dict, bin_edges); got {type(value).__name__}."
+                    )
+                if valid_dimensions is not None and dimension not in valid_dimensions:
+                    raise KeyError(
+                        f"Unknown dimension '{dimension}'. "
+                        f"Valid dimensions: {sorted(valid_dimensions)}"
+                    )
+                target_dict, bin_edges = value
+                self.dimensions[dimension] = DimensionTarget(dimension, target_dict, bin_edges)
 
     def set_temperature_bins(self, bin_edges: List[float]) -> "DistributionTarget":
-        """Set temperature bins for backwards-compatible simple format."""
-        if hasattr(self, "_pending_simple_target"):
+        """Inject bin edges for the backwards-compatible simple temperature target."""
+        if self._pending_simple_target is not None:
             self.dimensions["temperature"] = DimensionTarget(
                 "temperature", self._pending_simple_target, bin_edges
             )
-            del self._pending_simple_target
+            self._pending_simple_target = None
         return self
 
-    def partition_weight(
-        self,
-        temperature_counts: Optional[List[int]] = None,
-        timestamp_counts: Optional[List[int]] = None,
-        longitude_counts: Optional[List[int]] = None,
-        latitude_counts: Optional[List[int]] = None,
-    ) -> float:
+    def partition_weight(self, counts_by_dim: Dict[str, List[int]]) -> float:
         """
-        Score a partition by its contribution to all target distributions.
+        Score a partition by the product of all dimension weights.
 
         Parameters
         ----------
-        temperature_counts : histogram counts for temperature dimension
-        timestamp_counts : histogram counts for timestamp dimension
-        longitude_counts : histogram counts for longitude dimension
-        latitude_counts : histogram counts for latitude dimension
+        counts_by_dim : dict mapping dimension name → dense count list.
+            Only dimensions present in self.dimensions are consulted.
+            A missing array for a requested dimension returns 0.0.
 
         Returns
         -------
-        float in [0, 1]. Product of individual dimension weights.
-        Partitions with weight 0 are skipped.
+        float in [0, 1].  Returns 1.0 when no dimensions are configured.
         """
         if not self.dimensions:
-            return 1.0  # No targets defined
+            return 1.0
 
-        weights = []
-        for dimension, target in self.dimensions.items():
-            if dimension == "temperature":
-                if temperature_counts is None:
-                    return 0.0
-                weights.append(target.partition_weight(temperature_counts))
-            elif dimension == "timestamp":
-                if timestamp_counts is None:
-                    return 0.0
-                weights.append(target.partition_weight(timestamp_counts))
-            elif dimension == "longitude":
-                if longitude_counts is None:
-                    return 0.0
-                weights.append(target.partition_weight(longitude_counts))
-            elif dimension == "latitude":
-                if latitude_counts is None:
-                    return 0.0
-                weights.append(target.partition_weight(latitude_counts))
-
-        # Product of all dimension weights
         weight = 1.0
-        for w in weights:
-            weight *= w
+        for dimension, dim_target in self.dimensions.items():
+            counts = counts_by_dim.get(dimension)
+            if counts is None:
+                return 0.0
+            weight *= dim_target.partition_weight(counts)
         return weight

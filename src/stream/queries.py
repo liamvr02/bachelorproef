@@ -26,19 +26,55 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from connections import Connections
-from geo import (
+from stream.connections import Connections
+from stream.geo import (
     _LAT_DEG_PER_M, _LON_DEG_PER_M,
     _haversine_m, _spatialite_fetch_bbox,
     _temporal_clause, _temporal_order, _ts_epoch,
 )
-from poly_raster import (
+from stream.poly_raster import (
     _PolyRaster,
     _ua_fetch_candidates, _wis_fetch_candidates,
     _ua_make_circle, _ua_compute_fraction,
 )
 
 log = logging.getLogger("stream")
+
+
+# ---------------------------------------------------------------------------
+# Extra WHERE-fragment helper (attribute filters + planting-year temporal)
+# ---------------------------------------------------------------------------
+
+def _extra_where_fragment(
+    attr_filter: Optional[Dict[str, str]],
+    aanlegjaar_lte_scene: bool,
+    scene_ts: Optional[str],
+) -> str:
+    """
+    Build extra SQL WHERE fragments to be appended to existing radius queries.
+
+    *attr_filter* applies equality predicates: ``{"beheerfase": "Jeugdfase"}``
+    becomes ``AND beheerfase = 'Jeugdfase'``.  Values come from registry-time
+    constants (not user input) but are still single-quote-escaped.
+
+    *aanlegjaar_lte_scene* — when True, restricts trees rows to those already
+    planted at or before the scene's year *and* with a known ``aanlegjaar``
+    (i.e. excludes the ~73% of trees with NULL aanlegjaar, which would
+    otherwise contaminate the staggered-DiD treatment dose).
+    """
+    parts: List[str] = []
+    if attr_filter:
+        for col, val in attr_filter.items():
+            safe = str(val).replace("'", "''")
+            parts.append(f"AND {col} = '{safe}'")
+    if aanlegjaar_lte_scene:
+        if scene_ts is None:
+            raise ValueError("aanlegjaar_lte_scene requires scene_ts")
+        scene_year = int(str(scene_ts)[:4])
+        parts.append(
+            f"AND aanlegjaar IS NOT NULL AND aanlegjaar <= {scene_year}"
+        )
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +158,7 @@ def _select_temperature_from_emissivity(
 
 
 # ---------------------------------------------------------------------------
-# Row-level helpers (public — usable in custom feature callables)
+# Row-level helpers (public - usable in custom feature callables)
 # ---------------------------------------------------------------------------
 
 def query_nearest(
@@ -148,16 +184,16 @@ def query_nearest(
     Parameters
     ----------
     conn           : Connections object to database(s)
-    dataset_id     : Name of dataset to query (e.g., "lst", "dhm1", "ndvi")
+    dataset_id     : Name of dataset to query (e.g., "lst", "dhm", "ndvi")
     lon, lat       : Coordinates for spatial query
     timestamp      : ISO timestamp for temporal filtering
     columns        : List of column names to retrieve
     temporal       : Temporal filtering mode ("none", "last_previous", "nearest")
     radius_m       : Search radius in metres
     emissivity_mode: For dataset_id="lst" only. How to select LST value:
-                     "any"      → first non-null in order: ASTER > MODIS > NDVI
-                     "fallback" → ASTER > MODIS (NDVI never used as substitute)
-                     "aster"/"modis"/"ndvi" → use only that column (may be null)
+                     "any"      -> first non-null in order: ASTER > MODIS > NDVI
+                     "fallback" -> ASTER > MODIS (NDVI never used as substitute)
+                     "aster"/"modis"/"ndvi" -> use only that column (may be null)
                      (Ignored for non-LST datasets)
     """
     meta    = conn._meta[dataset_id]
@@ -263,12 +299,22 @@ def query_radius(
     columns: List[str],
     agg: str,
     temporal: str = "none",
+    attr_filter: Optional[Dict[str, str]] = None,
+    aanlegjaar_lte_scene: bool = False,
 ) -> dict:
     """
     Aggregate all points within *radius_m* metres of (lon, lat).
 
     *agg* is one of: "count", "avg", "sum", "min", "max".
     Returns {f"{col}_{agg}": value, "count": n} or {"count": 0} if empty.
+
+    *attr_filter* — optional equality predicates appended to the WHERE clause,
+    e.g. ``{"beheerfase": "Jeugdfase"}`` to count only juvenile trees.
+
+    *aanlegjaar_lte_scene* — when True (trees-only), restrict to rows with
+    ``aanlegjaar IS NOT NULL AND aanlegjaar <= year(timestamp)``.  This is
+    the staggered-DiD treatment-dose filter: count trees that were already
+    planted at the time of the LST observation and have a known planting year.
 
     This is the low-level building block used by aggregate_in_radius() and
     available to custom feature callables.
@@ -281,6 +327,9 @@ def query_radius(
     has_ts  = meta["temporal_behavior"] != "static"
 
     t_where = _temporal_clause(temporal, ts_col, timestamp) if has_ts else ""
+    extra_where = _extra_where_fragment(
+        attr_filter, aanlegjaar_lte_scene, timestamp,
+    )
     agg_up  = agg.upper()
     agg_sql = ", ".join(
         f"{agg_up}(CAST({c} AS REAL)) AS {c}_{agg}" for c in columns
@@ -301,7 +350,7 @@ def query_radius(
         rows = _spatialite_fetch_bbox(
             db, table, lon, lat, dlat, dlon,
             extra_cols=f"{ts_col_select}{col_select_str}",
-            extra_where=ts_where,
+            extra_where=f"{ts_where} {extra_where}".strip(),
         )
         if not rows:
             return {"count": 0}
@@ -340,6 +389,7 @@ def query_radius(
                      + pow((latitude  - {lat}) * 111320
                          * cos(radians({lat})), 2)) <= {radius_m}
             {t_where}
+            {extra_where}
         """
         row = db.execute(sql).fetchone()
         if row is None:
@@ -394,8 +444,8 @@ def query_wis_fraction(
     Return the fraction [0.0, 1.0] of a circle's area covered by WIS polygons
     whose *attr_col* equals *attr_val*.
 
-    Identical algorithm to query_urban_atlas_luc_fraction — R-tree pre-filter
-    in SpatiaLite then exact Shapely intersection — but targets the wis table.
+    Identical algorithm to query_urban_atlas_luc_fraction - R-tree pre-filter
+    in SpatiaLite then exact Shapely intersection - but targets the wis table.
     WIS is a single-timestamp (static) dataset; there is no temporal argument.
 
     This is the row-level building block available to custom feature callables.
@@ -492,14 +542,14 @@ def batch_nearest(
                 # After first query, log its cost so a slow environment is
                 # visible immediately rather than after the full batch.
                 if n_queries == 1:
-                    log.info("batch_nearest[%s]: first tile query -> %d candidates "
-                             "in %.3fs", dataset_id, len(rows), t_q)
+                    log.debug("batch_nearest[%s]: first tile query -> %d candidates "
+                              "in %.3fs", dataset_id, len(rows), t_q)
                 # Periodic summary every 100 unique tiles
                 elif n_queries % 100 == 0:
-                    log.info("batch_nearest[%s]: %d unique tiles queried, "
-                             "avg %.3fs/tile, elapsed %.1fs",
-                             dataset_id, n_queries,
-                             t_query_sum / n_queries, t_query_sum)
+                    log.debug("batch_nearest[%s]: %d unique tiles queried, "
+                              "avg %.3fs/tile, elapsed %.1fs",
+                              dataset_id, n_queries,
+                              t_query_sum / n_queries, t_query_sum)
 
                 if not rows:
                     cache[cache_key] = None
@@ -534,9 +584,9 @@ def batch_nearest(
                 for j, c in enumerate(columns):
                     col_arrays[c][i] = best[j]
 
-        log.info("batch_nearest[%s]: done - %d unique tiles, %.3fs total, avg %.3fs/tile",
-                 dataset_id, n_queries,
-                 t_query_sum, t_query_sum / max(n_queries, 1))
+        log.debug("batch_nearest[%s]: done - %d unique tiles, %.3fs total, avg %.3fs/tile",
+                  dataset_id, n_queries,
+                  t_query_sum, t_query_sum / max(n_queries, 1))
 
         return pd.DataFrame(col_arrays, index=df.index)
 
@@ -604,8 +654,8 @@ def batch_nearest(
             n_queries   += 1
             cache[cache_key] = tuple(row[:len(columns)]) if row else None
 
-        log.info("batch_nearest[%s]: done - %d unique tiles, %.3fs total, avg %.3fs/tile",
-                 dataset_id, n_queries, t_query_sum, t_query_sum / max(n_queries, 1))
+        log.debug("batch_nearest[%s]: done - %d unique tiles, %.3fs total, avg %.3fs/tile",
+                  dataset_id, n_queries, t_query_sum, t_query_sum / max(n_queries, 1))
 
         for i in range(len(df)):
             date_key  = tss_in[i][:10] if has_ts else "static"
@@ -626,6 +676,8 @@ def batch_radius(
     agg: str,
     temporal: str,
     radius_m: float,
+    attr_filter: Optional[Dict[str, str]] = None,
+    aanlegjaar_lte_scene: bool = False,
 ) -> pd.DataFrame:
     """
     Aggregate all points within *radius_m* metres for every row in *df*.
@@ -673,10 +725,17 @@ def batch_radius(
     tile_ids = df["tile_id"].to_numpy(dtype=str)
 
     cache: Dict[str, dict] = {}
-    cache_keys = np.array([
-        f"{tid}:{ts[:10] if has_ts else 'static'}"
-        for tid, ts in zip(tile_ids, tss)
-    ])
+    if aanlegjaar_lte_scene:
+        # Result depends on the scene's calendar year — cache by (tile, year).
+        cache_keys = np.array([
+            f"{tid}:ay{ts[:4]}"
+            for tid, ts in zip(tile_ids, tss)
+        ])
+    else:
+        cache_keys = np.array([
+            f"{tid}:{ts[:10] if has_ts else 'static'}"
+            for tid, ts in zip(tile_ids, tss)
+        ])
 
     for i, cache_key in enumerate(cache_keys):
         if cache_key in cache:
@@ -685,6 +744,9 @@ def batch_radius(
         lat = lats[i]
         ts  = tss[i]
         t_where = t_where_tpl.format(ts=ts) if t_where_tpl else ""
+        extra_where = _extra_where_fragment(
+            attr_filter, aanlegjaar_lte_scene, ts,
+        )
 
         if store == "spatialite":
             db  = conns.spatialite(db_file)
@@ -695,7 +757,7 @@ def batch_radius(
             rows = _spatialite_fetch_bbox(
                 db, table, lon, lat, dlat, dlon,
                 extra_cols=f"{ts_col_select}{col_select_str}",
-                extra_where=t_where,
+                extra_where=f"{t_where} {extra_where}".strip(),
             )
             if not rows:
                 cache[cache_key] = {"count": 0}
@@ -732,8 +794,11 @@ def batch_radius(
                          + pow((f.latitude  - {lat}) * 111320
                              * cos(radians({lat})), 2)) <= {radius_m}
                 {t_where}
+                {extra_where}
             """
+            
             db_row = db.execute(sql).fetchone()
+
             cache[cache_key] = (
                 dict(zip(out_cols, db_row)) if db_row else {"count": 0}
             )

@@ -1,203 +1,191 @@
 """
-stream_example.py – Stream 5M rows from multiple timestamps and save to CSV.
+stream_example.py - Stream 5 M rows with even temporal distribution.
 
-Demonstrates:
-- Building a FeatureRegistry with Urban Atlas classifications at multiple resolutions
-- Configuring the stream with selected partitions and optional distribution weighting
-- Streaming LST rows with computed features
-- Saving results to CSV
+Demonstrates how to use the generalised distribution targeting system to
+achieve an even spread of samples across:
+  • calendar year  (2000-2025)
+  • month of year  (January-December)
+  • hour of day    (00:00-23:59 UTC, expressed as a fractional float)
+
+Passing an empty dict {} as the target for any dimension is the uniform
+shorthand: the system assigns equal desired probability to every bin.
+
+The DistributionTarget scores each monthly partition by the product of its
+overlap with each requested distribution.  Partitions are then ordered by
+score descending so the most temporally diverse data is streamed first.
+Early stopping via max_rows lets you collect a well-distributed sample
+without reading the entire dataset.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from stream import (
-    StreamConfig,
-)
+from stream.config import get_dimension_edges
+from stream.features import FeatureRegistry, aggregate_in_radius, nearest, urban_atlas_classifications_fractions
+from stream.classification_groups import UA
+from stream.stream import StreamConfig
 
-from features import (
-    FeatureRegistry,
-    nearest,
-    aggregate_in_radius,
-    urban_atlas_classifications_fractions,
-)
 
-from classification_groups import UA
-
+# ============================================================
+# Feature registry
+# ============================================================
 
 def build_registry() -> FeatureRegistry:
     """
-    Build a FeatureRegistry with base features and UA classifications.
-    
-    Features registered:
-    - Elevation (DHM1) at query location
-    - Tree density within 50m
-    - UA classifications at 100m and 30m
-    
-    Note: NDVI is now integrated into the LST table (alongside aster_lst, modis_lst)
-          and is available as an output column, not queried as a separate dataset.
+    Build a feature registry with a representative set of spatial features.
+
+    The time-component columns (year, month_of_year, day_of_month,
+    day_of_year, hour_of_day) are always present in every output batch
+    without needing explicit registration - they come directly from the
+    lst table and appear in FeatureRow and the yielded DataFrames.
     """
     reg = FeatureRegistry()
-    
-    # Base features
-    reg.add(nearest("dhm1", columns=["elevation"], temporal="last_previous"))
-    reg.add(aggregate_in_radius(
-        "trees",
-        radius_m=50,
-        columns=[],
-        agg="count",
-        temporal="none",
-    ))
-    
-    # UA classifications at 100m and 30m
-    reg.add(urban_atlas_classifications_fractions(
-        classification_map=UA,
-        radius_m=100,
-    ))
-    reg.add(urban_atlas_classifications_fractions(
-        classification_map=UA,
-        radius_m=30,
-    ))
-    
+
+    # Nearest elevation from the 2007 digital height model
+    reg.add(nearest("dhm", columns=["elevation"], temporal="last_previous"))
+
+    # Tree count within 50 m
+    reg.add(aggregate_in_radius("trees", radius_m=50, columns=[], agg="count", temporal="none"))
+
+    # Urban Atlas land-use fractions at 100 m and 30 m radii
+    reg.add(urban_atlas_classifications_fractions(classification_map=UA, radius_m=100))
+    reg.add(urban_atlas_classifications_fractions(classification_map=UA, radius_m=30))
+
     return reg
 
 
-def stream_to_dataframe_filtered(
+# ============================================================
+# Stream helpers
+# ============================================================
+
+def make_even_temporal_config(
     max_rows: int = 5_000_000,
-    num_timestamps: int = 20,
-    multi_dimensional: bool = False,
-) -> pd.DataFrame:
+    also_balance_temperature: bool = False,
+) -> StreamConfig:
     """
-    Stream LST rows from multiple timestamps with computed features and save to CSV.
-    
+    Build a StreamConfig that targets an even distribution over time.
+
+    Dimensions targeted
+    -------------------
+    year          - uniform across all 26 calendar years (2000-2025)
+    month_of_year - uniform across all 12 calendar months
+    hour_of_day   - uniform across all 24 UTC hours (fractional)
+
+    Optionally also balance temperature (biases away from very common
+    warm summer values toward the full -10 °C to 60 °C range).
+
     Parameters
     ----------
     max_rows : int
-        Target number of rows to stream
-    num_timestamps : int
-        Minimum number of distinct months to include
-    multi_dimensional : bool
-        If True, target distributions across temperature, timestamp, and location.
-        If False, use temperature-only (backwards compatible).
-        
-    Returns
-    -------
-    pd.DataFrame
-        Streamed data with all computed features
+        Upper bound on rows to collect.  Passed to stream() so early stopping
+        happens before feature computation rather than after.
+    also_balance_temperature : bool
+        When True, adds a mildly non-uniform temperature target that gives
+        extra weight to cooler and hotter extremes.
     """
-    # Get available partitions
     cfg = StreamConfig()
-    cfg._load_catalog()
-    all_partitions = sorted(cfg._partition_stats, key=lambda p: p["partition_key"])\
-        if hasattr(cfg, '_partition_stats') and cfg._partition_stats else \
-        [{} for _ in cfg._partition_keys]
-    
-    # Select partitions spanning the time range
-    if len(all_partitions) < num_timestamps:
-        selected_partitions = cfg._partition_keys if hasattr(cfg, '_partition_keys') else []
-    else:
-        step = len(cfg._partition_keys) // num_timestamps if hasattr(cfg, '_partition_keys') else 1
-        selected_partitions = [
-            cfg._partition_keys[i * step] if hasattr(cfg, '_partition_keys') else ""
-            for i in range(num_timestamps)
-        ]
-    
-    print(f"Streaming from {len(selected_partitions)} partitions (months)")
-    
-    # Configure stream with selected partitions
-    cfg = StreamConfig(partition_keys=selected_partitions)
-    
-    if multi_dimensional:
-        # Multi-dimensional distribution targeting:
-        # Temperature, timestamp, and geographic location
-        print("Using multi-dimensional distribution targeting...")
-        
-        # Temperature bins (2°C from -10 to 60°C)
-        temp_edges = [float(v) for v in np.linspace(-10.0, 60.0, 36)]
-        
-        # Timestamp bins (seasonal: Q1-Q4 for each year from 2000 to 2025)
-        ts_edges = [
-            f"{year:04d}-Q{quarter}"
-            for year in range(2000, 2026)
-            for quarter in range(1, 5)
-        ]
-        
-        # Coordinate bins (0.1 degree resolution)
-        lon_edges = [float(v) for v in np.linspace(-180.0, 180.0, 3601)]
-        lat_edges = [float(v) for v in np.linspace(-90.0, 90.0, 1801)]
-        
-        # Set multi-dimensional targets
-        cfg.set_distribution({
-            "temperature": (
-                {10: 0.05, 15: 0.15, 20: 0.25, 25: 0.30, 30: 0.20, 35: 0.05},
-                temp_edges
-            ),
-            "timestamp": (
-                {
-                    "2010-Q2": 0.25,  # Spring 2010
-                    "2015-Q3": 0.25,  # Summer 2015
-                    "2020-Q2": 0.25,  # Spring 2020
-                    "2020-Q3": 0.25,  # Summer 2020
-                },
-                ts_edges
-            ),
-            "longitude": (
-                {3.0: 0.5, 3.5: 0.5},  # Ghent is around 3.7°E
-                lon_edges
-            ),
-        })
-    else:
-        # Simple temperature-only distribution (backwards compatible)
-        print("Using temperature-only distribution targeting...")
-        cfg.set_distribution({
-            10: 0.05,
-            15: 0.15,
-            20: 0.25,
-            25: 0.30,
-            30: 0.20,
-            35: 0.05,
-        })
-    
-    # Build feature registry
-    reg = build_registry()
-    
-    print(f"Streaming {max_rows:,} rows with {len(reg._descriptors)} features...")
-    
-    # Stream to dataframe
-    df = cfg.to_dataframe(registry=reg, max_rows=max_rows)
-    
-    print(f"Collected {len(df):,} rows with {df.shape[1]} columns")
-    
-    return df
 
+    distribution: dict = {
+        # {} = uniform over all bins of this dimension
+        "year":          ({}, get_dimension_edges("year")),
+        "month_of_year": ({}, get_dimension_edges("month_of_year")),
+        "hour_of_day":   ({}, get_dimension_edges("hour_of_day")),
+    }
+
+    if also_balance_temperature:
+        # Slightly up-weight the tails relative to a purely uniform target.
+        # The proportions are normalised to sum 1 inside DimensionTarget.
+        distribution["temperature"] = (
+            {
+                -5: 0.05,
+                 5: 0.08,
+                10: 0.10,
+                15: 0.12,
+                20: 0.15,
+                25: 0.15,
+                30: 0.12,
+                35: 0.10,
+                40: 0.08,
+                45: 0.05,
+            },
+            get_dimension_edges("temperature"),
+        )
+
+    cfg.set_distribution(distribution)
+    return cfg
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main() -> None:
     """
-    Main entry point: stream 5M rows from 20+ timestamps and save to CSV.
-    
-    Set multi_dimensional=True to use temperature + timestamp + location targeting,
-    or False for temperature-only (default).
+    Stream 5 M LST rows with even temporal coverage and save to CSV.
+
+    Steps
+    -----
+    1.  Build a StreamConfig that weights partitions for even year / month /
+        hour_of_day coverage.
+    2.  Build a FeatureRegistry with spatial features.
+    3.  Stream up to max_rows rows; partitions ordered by temporal-coverage
+        weight so the richest months come first.
+    4.  Save the resulting DataFrame to CSV.
+    5.  Print a temporal balance report.
     """
+    max_rows = 20_000_000
+
     print("=" * 70)
-    print("Streaming 5M rows from 20+ timestamps...")
+    print(f"Streaming {max_rows:,} rows with even temporal distribution")
+    print("  Dimensions: year, month_of_year, hour_of_day  (uniform)")
     print("=" * 70)
-    
-    # Change multi_dimensional=True to use multi-dimensional distribution targeting
-    df = stream_to_dataframe_filtered(
-        max_rows=5_000_000,
-        num_timestamps=20,
-        multi_dimensional=False,  # Set to True for multi-dimensional targeting
+
+    cfg = make_even_temporal_config(max_rows=max_rows, also_balance_temperature=False)
+    reg = build_registry()
+
+    batches = []
+    for batch_df in cfg.stream(reg, batch_size=10_000, max_rows=max_rows):
+        batches.append(batch_df)
+
+    if not batches:
+        print("No rows collected.")
+        return
+
+    df = pd.concat(batches, ignore_index=True)
+    print(f"\nCollected {len(df):,} rows, {df.shape[1]} columns")
+
+    # ---- Temporal balance report ----------------------------------------
+    print("\n── Year distribution (top 10) ──────────────────────────────────")
+    print(
+        df["year"]
+        .value_counts()
+        .sort_index()
+        .to_string()
     )
-    
-    # Save to CSV
+
+    print("\n── Month-of-year distribution ───────────────────────────────────")
+    month_names = {
+        1:"Jan", 2:"Feb", 3:"Mar", 4:"Apr", 5:"May", 6:"Jun",
+        7:"Jul", 8:"Aug", 9:"Sep", 10:"Oct", 11:"Nov", 12:"Dec",
+    }
+    month_counts = df["month_of_year"].value_counts().sort_index()
+    for m, cnt in month_counts.items():
+        bar = "█" * int(30 * cnt / month_counts.max())
+        print(f"  {month_names.get(m, m):>3}  {cnt:>8,}  {bar}")
+
+    print("\n── Hour-of-day distribution (binned to nearest hour) ────────────")
+    hour_counts = df["hour_of_day"].apply(lambda h: int(h)).value_counts().sort_index()
+    for h, cnt in hour_counts.items():
+        bar = "█" * int(30 * cnt / hour_counts.max())
+        print(f"  {h:>2}h  {cnt:>8,}  {bar}")
+
+    # ---- Save -------------------------------------------------------------
     output_path = Path("sample_stream_output.csv")
-    print(f"\nSaving to {output_path}...")
     df.to_csv(output_path, index=False)
-    print(f"✓ Saved {len(df):,} rows to {output_path}")
+    print(f"\n✓ Saved {len(df):,} rows -> {output_path}")
     print("=" * 70)
 
 

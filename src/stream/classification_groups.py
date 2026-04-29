@@ -19,4 +19,62 @@ UA = {
     ]
 }
 
-WIS = {}
+WIS_BESTEMMING = {
+    "gemotoriseerd_verkeer": [
+        "Rijweg",
+        "Parkeerstrook",
+        "Oprit",
+        "Tram- en busbaan"
+    ],
+    "langzaam verkeer": [
+        "Fietspad",
+        "Voetpad",
+        "Fietspad/voetpad"
+    ],
+    "groen": [
+        "Beplantingen",
+        "Houtachtigen",
+        "Hagen",
+        "Bermen",
+        "Grasachtigen"
+    ],
+    "andere": [
+        "Andere",
+        "Kaaimuur",
+        "Waterlichaam"
+    ]
+}
+
+WIS_MATERIAAL = {
+    "volledig_verhard": [
+        "Gebakken klinkers",
+        "Betontegels",
+        "Betondallen",
+        "Ineengrijpende Betonstenen",
+        "Betonstenen",
+        "Blindengeleidetegels",
+        "Natuursteentegels",
+        "Natuursteendallen",
+        "Natuursteen Platienen",
+        "Natuursteen Mozaiek",
+        "Natuursteen Kasseien met gesloten voeg",
+        "Materiaal Beton",
+        "Materiaal natuursteen",
+        "Sierverharding Betonproduct",
+        "KWS",
+        "Overlaging"
+    ],
+    "semi_permeabel": [
+        "Waterdoorlatende betonstraatstenen",
+        "Grindgazon",
+        "Grasdallen",
+        "Halfharde verharding",
+        "Natuursteen Kasseien met open voeg"
+    ],
+    "onverhard": [
+        "Onverhard"
+    ],
+    "andere": [
+        "Andere materialen"
+    ]
+}

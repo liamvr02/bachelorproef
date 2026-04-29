@@ -16,9 +16,9 @@ Quick start
 
     # Register features from the built-in framework
     reg = FeatureRegistry()
-    reg.add(nearest("dhm1",        columns=["elevation"],  temporal="last_previous"))
+    reg.add(nearest("dhm",         columns=["elevation"],  temporal="last_previous"))
     reg.add(nearest("ndvi",        columns=["ndvi"],       temporal="nearest"))
-    reg.add(aggregate_in_radius("trees", radius_m=50,      columns=["height_m"],
+    reg.add(aggregate_in_radius("trees", radius_m=50,      columns=["hoogte"],
                                  agg="count",              temporal="none"))
 
     # Urban Atlas land-use fraction within a radius
@@ -28,12 +28,12 @@ Quick start
     # Custom feature using framework building-blocks (row-level API)
     from stream import query_nearest, query_urban_atlas_luc_fraction
     def my_feature(row, connections):
-        elev = query_nearest(connections, "dhm2", row.longitude, row.latitude,
+        elev = query_nearest(connections, "dhm", row.longitude, row.latitude,
                              row.timestamp, columns=["elevation"],
                              temporal="last_previous")
         frac = query_urban_atlas_luc_fraction(connections, row.longitude, row.latitude,
                                               radius_m=200, luc_code="11100")
-        return {"dhm2_elev_log": math.log1p(elev.get("elevation", 0)),
+        return {"dhm_elev_log": math.log1p(elev.get("elevation", 0)),
                 "urban_frac_200m": frac}
     reg.add_custom(my_feature, name="custom_urban_elev")
 
@@ -104,25 +104,26 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Sub-module imports
 # ---------------------------------------------------------------------------
-from connections import Connections
-from distribution import DistributionTarget
-from features import (
+from stream.config import DIMENSION_CATALOG, get_dimension_edges
+from stream.connections import Connections
+from stream.distribution import DistributionTarget
+from stream.features import (
     FeatureRow, FeatureRegistry,
     _FeatureDescriptor,
     nearest, aggregate_in_radius,
     urban_atlas_luc_fraction, wis_fraction,
 )
-from geo import (
+from stream.geo import (
     DEFAULT_PREPARED, _LAT_DEG_PER_M, _LON_DEG_PER_M,
     GHENT_LON_MIN, GHENT_LON_MAX, GHENT_LAT_MIN, GHENT_LAT_MAX,
 )
-from logging_config import configure_logging
-from poly_raster import (
+from stream.logging_config import configure_logging
+from stream.poly_raster import (
     _PolyRaster,
     _ua_fetch_all_in_bbox, _wis_fetch_all_in_bbox,
-    _rasterise_layer,
+    _rasterise_layer, _rasterise_layer_fft,
 )
-from queries import (
+from stream.queries import (
     query_nearest, query_radius,
     query_urban_atlas_luc_fraction, query_wis_fraction,
     batch_nearest, batch_radius,
@@ -153,10 +154,19 @@ class StreamConfig:
 
     Distribution Targeting
     ----------------------
-    Supports weighted sampling based on target distributions across dimensions:
-      - temperature: LST values in degrees C
-      - timestamp: observation dates (ISO format)
-      - longitude / latitude: geographic coordinates
+    Supports weighted partition sampling across any dimension registered in
+    config.DIMENSION_CATALOG.  Pass {} as the target dict for any dimension
+    to request a uniform (flat) distribution over all its bins.
+
+    Available dimensions (see config.DIMENSION_CATALOG for the full list):
+      - temperature    LST value in °C
+      - timestamp      quarterly label "YYYY-Q{1..4}" (coarse year scoring)
+      - year           calendar year (2000–2025)
+      - month_of_year  month 1–12
+      - day_of_month   day within month 1–31
+      - day_of_year    day within year 1–366 (12 monthly-breakpoint bins)
+      - hour_of_day    fractional UTC hour 0.0–24.0
+      - longitude / latitude  geographic coordinates
 
     Examples
     --------
@@ -164,23 +174,23 @@ class StreamConfig:
         cfg = StreamConfig(Path("prepared_stream_data"))
         cfg.set_distribution({20: 0.4, 25: 0.4, 30: 0.2})
 
-    With emissivity control:
-        cfg = StreamConfig(
-            Path("prepared_stream_data"),
-            lst_emissivity_mode="fallback",  # ASTER > MODIS only
-            lst_null_handling="impute"
-        )
-
-    Multi-dimensional (temperature + geographic location):
-        cfg = StreamConfig(Path("prepared_stream_data"))
+    Even distribution across year, month, and hour:
+        from config import get_dimension_edges
         cfg.set_distribution({
-            "temperature": ({20: 0.3, 25: 0.4, 30: 0.3}, bin_edges_temp),
-            "longitude": ({3.2: 0.5, 3.3: 0.5}, bin_edges_lon),
+            "year":          ({}, get_dimension_edges("year")),
+            "month_of_year": ({}, get_dimension_edges("month_of_year")),
+            "hour_of_day":   ({}, get_dimension_edges("hour_of_day")),
+        })
+
+    Mixed: skewed temperature + uniform hour-of-day:
+        cfg.set_distribution({
+            "temperature": ({20: 0.3, 25: 0.5, 30: 0.2}, get_dimension_edges("temperature")),
+            "hour_of_day": ({},                            get_dimension_edges("hour_of_day")),
         })
 
     Streaming:
         reg = FeatureRegistry()
-        reg.add(nearest("dhm1", ["elevation"], temporal="last_previous"))
+        reg.add(nearest("dhm", ["elevation"], temporal="last_previous"))
         reg.add(aggregate_in_radius("trees", 50, [], agg="count"))
 
         for batch_df in cfg.stream(reg, batch_size=5_000):
@@ -228,7 +238,9 @@ class StreamConfig:
         self.lst_null_handling   = lst_null_handling
         self._distribution: Optional[DistributionTarget] = None
         self._catalog_meta: Optional[dict] = None
-        self._bin_edges_dict: Dict[str, List[float]] = {}  # temperature, timestamp, longitude, latitude
+        # Bin edges keyed by dimension name, loaded from catalog histogram_config.
+        # Numeric dimensions store list[float]; string dimensions store list[str].
+        self._bin_edges_dict: Dict[str, list] = {}
         self._partition_stats: Optional[List[dict]] = None
         # Raster cache lives two levels above stream.py: /src/stream_cache/rasters/
         self._raster_cache_dir: Path = (
@@ -237,23 +249,29 @@ class StreamConfig:
 
     def set_distribution(self, target: Dict) -> "StreamConfig":
         """
-        Define a target distribution for weighted sampling.
-
-        Supports both simple temperature-only and multi-dimensional targeting.
+        Define a target distribution for weighted partition sampling.
 
         Parameters
         ----------
-        target : dict
-            For simple temperature-only (backwards compatible):
-                {15: 0.2, 20: 0.3, 25: 0.3, 30: 0.2}
-            For multi-dimensional:
+        target : dict — two accepted formats:
+
+            Multi-dimension (recommended):
                 {
-                    "temperature": ({15: 0.2, 20: 0.3, 25: 0.3, 30: 0.2}, bin_edges),
-                    "timestamp": ({...}, bin_edges),
-                    ...
+                    "year":          ({}, year_edges),   # {} = uniform
+                    "month_of_year": ({}, month_edges),
+                    "hour_of_day":   ({}, hour_edges),
+                    "temperature":   ({20: 0.3, 25: 0.5, 30: 0.2}, temp_edges),
                 }
+            Any dimension name in config.DIMENSION_CATALOG is valid.
+            An empty target dict {} means "uniform over all bins".
+
+            Simple (backwards-compatible, temperature only):
+                {15: 0.2, 20: 0.3, 25: 0.5}
         """
-        self._distribution = DistributionTarget(target)
+        self._distribution = DistributionTarget(
+            target,
+            valid_dimensions=set(DIMENSION_CATALOG.keys()),
+        )
         return self
 
     def _resolve_lst_temperature(self, df: pd.DataFrame) -> np.ndarray:
@@ -346,26 +364,26 @@ class StreamConfig:
         log.debug("catalog: dataset_metadata loaded (%d datasets) in %.3fs",
                   len(self._catalog_meta), time.perf_counter() - t1)
 
-        # Histogram config - load bin edges for all dimensions (stored as VARCHAR[] arrays)
+        # Histogram config — load bin edges for every dimension stored in the catalog.
+        # Numeric dimensions (float edges) are stored as VARCHAR[] and parsed back to float.
+        # String dimensions (e.g. quarterly timestamp labels) are kept as str.
+        # The 'numeric' boolean column (added in the updated catalog schema) drives parsing.
         t1 = time.perf_counter()
-        rows = conn.execute("SELECT dataset_id, bin_edges FROM histogram_config").fetchall()
-        for dataset_id, edges_array in rows:
+        rows = conn.execute(
+            "SELECT dataset_id, bin_edges, numeric FROM histogram_config"
+        ).fetchall()
+        for dim_name, edges_array, is_numeric in rows:
             if edges_array:
-                # Parse numeric dimensions (temperature, longitude, latitude) to float
-                # Keep timestamp as strings (e.g., "2000-Q1")
-                if dataset_id in ("temperature", "longitude", "latitude"):
-                    self._bin_edges_dict[dataset_id] = [float(v) for v in edges_array]
-                else:  # timestamp or other string-based dimensions
-                    self._bin_edges_dict[dataset_id] = list(edges_array)
-        if "temperature" in self._bin_edges_dict:
-            log.debug("catalog: loaded %d temperature bins", len(self._bin_edges_dict["temperature"]))
-        if "timestamp" in self._bin_edges_dict:
-            log.debug("catalog: loaded %d timestamp bins", len(self._bin_edges_dict["timestamp"]))
-        if "longitude" in self._bin_edges_dict:
-            log.debug("catalog: loaded %d longitude bins", len(self._bin_edges_dict["longitude"]))
-        if "latitude" in self._bin_edges_dict:
-            log.debug("catalog: loaded %d latitude bins", len(self._bin_edges_dict["latitude"]))
-        log.debug("catalog: histogram_config loaded in %.3fs", time.perf_counter() - t1)
+                self._bin_edges_dict[dim_name] = (
+                    [float(v) for v in edges_array] if is_numeric
+                    else list(edges_array)
+                )
+        log.debug(
+            "catalog: histogram_config loaded — %d dimension(s): %s  (%.3fs)",
+            len(self._bin_edges_dict),
+            list(self._bin_edges_dict.keys()),
+            time.perf_counter() - t1,
+        )
 
         # Partition list
         t1 = time.perf_counter()
@@ -698,6 +716,21 @@ class StreamConfig:
             except sqlite3.OperationalError:
                 continue
 
+        # Idempotent B-tree indexes on attribute columns used by raster
+        # precompute.  Without these, COUNT/SELECT WHERE bestemming=? does a
+        # full-table scan and a single dense WIS class can take >40 minutes.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_wis_bestemming     ON wis(bestemming)",
+            "CREATE INDEX IF NOT EXISTS idx_wis_materiaalsoort ON wis(materiaalsoort)",
+            "CREATE INDEX IF NOT EXISTS idx_ua_luc_code        ON urban_atlas(luc_code)",
+            "CREATE INDEX IF NOT EXISTS idx_ua_year            ON urban_atlas(ua_year)",
+        ):
+            try:
+                db.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                log.debug("raster: index ensure skipped (%s): %s", stmt, exc)
+        db.commit()
+
         total_cells    = n_lon * n_lat
         t_raster_start = time.perf_counter()
         n_cache_hits   = 0
@@ -711,36 +744,47 @@ class StreamConfig:
         )
 
         # ---- Step 6: per-layer cache-check → rasterise → save ----
-        with tqdm(total=len(all_layers), desc="Raster layers",
+        n_total_layers = len(all_layers)
+        with tqdm(total=n_total_layers, desc="Raster layers",
                   unit="layer", position=0, dynamic_ncols=True) as layer_bar:
-            for layer_type, spec in all_layers:
+            for layer_idx, (layer_type, spec) in enumerate(all_layers, start=1):
+                tag = f"[{layer_idx}/{n_total_layers}]"
                 if layer_type == "ua":
                     luc_code, layer_radius_m, year = spec
                     layer_key = f"{luc_code}:{year}"
+                    cache_layer_key = layer_key
                 elif layer_type == "wis":
                     attr_col, attr_val, layer_radius_m = spec
                     layer_key = f"wis:{attr_val}"
+                    # WIS now uses the FFT rasteriser; tag the cache key so
+                    # stale entries from the old vector path are skipped.
+                    cache_layer_key = f"fft:{layer_key}"
                 else:
                     layer_bar.update(1)
                     continue
 
                 # --- cache hit? ---
                 if cache_conn is not None:
+                    t_cache_lookup = time.perf_counter()
                     hit = self._load_layer_from_cache(
-                        cache_conn, gkey, layer_key, n_lon, n_lat,
+                        cache_conn, gkey, cache_layer_key, n_lon, n_lat,
                     )
+                    t_cache_lookup = time.perf_counter() - t_cache_lookup
                     if hit is not None:
                         arr, n_nonzero = hit
                         raster._layers[layer_key]   = arr
                         raster._coverage[layer_key] = n_nonzero
                         n_cache_hits += 1
-                        log.debug("raster cache: HIT  %s/%s  (%d non-zero)",
-                                  gkey, layer_key, n_nonzero)
+                        log.info("raster %s cache HIT  %s  (%d non-zero, %.2fs)",
+                                 tag, cache_layer_key, n_nonzero, t_cache_lookup)
                         layer_bar.set_postfix(
                             hit=n_cache_hits, computed=n_computed, refresh=False
                         )
                         layer_bar.update(1)
                         continue
+                    else:
+                        log.debug("raster %s cache MISS %s (lookup %.2fs) — computing",
+                                  tag, cache_layer_key, t_cache_lookup)
 
                 # --- cache miss: rasterise ---
                 arr = raster.add_layer(layer_key)
@@ -749,6 +793,7 @@ class StreamConfig:
                 dlat_r = layer_radius_m * _LAT_DEG_PER_M
                 dlon_r = layer_radius_m * _LON_DEG_PER_M
 
+                t_fetch = time.perf_counter()
                 if layer_type == "ua":
                     all_blobs = _ua_fetch_all_in_bbox(
                         db, luc_code, year,
@@ -757,7 +802,7 @@ class StreamConfig:
                         raster.grid_lon(n_lon-1) + dlon_r,
                         raster.grid_lat(n_lat-1) + dlat_r,
                     )
-                    tqdm_desc = f"  UA {luc_code} {year}"
+                    tqdm_desc = f"  UA {luc_code} {year} r={int(layer_radius_m)}m"
                 else:
                     all_blobs = _wis_fetch_all_in_bbox(
                         db, attr_col, attr_val,
@@ -766,32 +811,56 @@ class StreamConfig:
                         raster.grid_lon(n_lon-1) + dlon_r,
                         raster.grid_lat(n_lat-1) + dlat_r,
                     )
-                    tqdm_desc = f"  WIS {attr_val}"
+                    tqdm_desc = f"  WIS {attr_val} r={int(layer_radius_m)}m"
+                t_fetch = time.perf_counter() - t_fetch
 
-                log.info("raster: %s — %d polygon(s) in bbox",
-                         layer_key, len(all_blobs))
-
-                n_nonzero = _rasterise_layer(
-                    arr, raster, all_blobs, layer_radius_m,
-                    desc=tqdm_desc,
+                total_blob_bytes = sum(len(b) for b in all_blobs)
+                log.debug(
+                    "raster %s %s r=%dm: fetched %d polygon(s) (%.1f MB WKB) in %.2fs",
+                    tag, layer_key, int(layer_radius_m),
+                    len(all_blobs), total_blob_bytes / 1e6, t_fetch,
                 )
+
+                t_rast = time.perf_counter()
+                # Dispatch: WIS classes are dense (thousands of small adjacent
+                # road polygons within radius) — use FFT convolution path.
+                # UA stays on the vector path: most LUC codes are sparse and
+                # the FFT setup cost is a net loss when only a handful of
+                # polygons are involved.
+                if layer_type == "wis":
+                    n_nonzero = _rasterise_layer_fft(
+                        arr, raster, all_blobs, layer_radius_m,
+                        desc=tqdm_desc,
+                    )
+                else:
+                    n_nonzero = _rasterise_layer(
+                        arr, raster, all_blobs, layer_radius_m,
+                        desc=tqdm_desc,
+                    )
+                t_rast = time.perf_counter() - t_rast
                 raster._coverage[layer_key] = n_nonzero
                 elapsed = time.perf_counter() - t_layer
                 n_computed += 1
+                pct_nonzero = 100.0 * n_nonzero / total_cells if total_cells else 0
                 log.info(
-                    "raster: %s (r=%.0fm) done — %d non-zero cells, "
-                    "%.1fs (%.0f cells/s)",
-                    layer_key, layer_radius_m, n_nonzero, elapsed,
+                    "raster %s %s done: %d non-zero cells (%.1f%%), "
+                    "fetch %.2fs, rasterise %.2fs, total %.2fs (%.0f cells/s)",
+                    tag, layer_key, n_nonzero, pct_nonzero,
+                    t_fetch, t_rast, elapsed,
                     total_cells / elapsed if elapsed > 0 else 0,
                 )
 
                 # --- write to cache immediately ---
                 if cache_conn is not None:
+                    t_cache_save = time.perf_counter()
                     self._save_layer_to_cache(
-                        cache_conn, gkey, layer_key, layer_radius_m,
+                        cache_conn, gkey, cache_layer_key, layer_radius_m,
                         arr, n_nonzero,
                         lon0, lat0, step_lon, step_lat, n_lon, n_lat, res_m,
                     )
+                    t_cache_save = time.perf_counter() - t_cache_save
+                    log.debug("raster %s %s cached in %.2fs",
+                              tag, cache_layer_key, t_cache_save)
 
                 layer_bar.set_postfix(
                     hit=n_cache_hits, computed=n_computed, refresh=False
@@ -821,10 +890,29 @@ class StreamConfig:
         """
         Return list of (partition_key, weight) sorted by weight descending.
 
-        When no distribution is set: all partition_keys with weight 1.0.
-        When a distribution is set: score each partition using the selected
-        dimensions (temperature, timestamp, coordinates). Score is computed
-        inside DuckDB as a product of dimension weights.
+        When no distribution is set all partitions are returned with weight 1.0.
+
+        When a distribution is set the method:
+        1.  Builds a single DuckDB query that SELECTs the histogram arrays for
+            every requested dimension from partition_statistics.
+        2.  Computes a per-partition weight as the product of per-dimension
+            overlap scores (sum of min(actual, target) per bin).
+        3.  Returns partitions ordered by weight descending so that the
+            highest-value data is streamed first.
+
+        The query is constructed data-driven from DIMENSION_CATALOG so adding
+        a new dimension requires no changes here — only entries in config.py
+        and catalog.py.
+
+        Weight expression (per dimension)
+        ----------------------------------
+        For a histogram array `counts` and a target vector `T` (same length):
+
+            weight = SUM_i  min(counts[i] / total, T[i])
+
+        This is the standard histogram-overlap metric: 1.0 when the partition
+        matches the target perfectly, 0.0 when there is no overlap at all.
+        The overall partition weight is the product over all active dimensions.
         """
         all_keys = getattr(self, "_partition_keys", [])
 
@@ -838,189 +926,166 @@ class StreamConfig:
         if self._distribution is None or not self._distribution.dimensions:
             return [(pk, 1.0) for pk in sorted(all_keys)]
 
-        # Build SQL to score partitions on requested dimensions
-        pk_filter = ", ".join(f"'{pk}'" for pk in all_keys)
         dimensions_to_score = list(self._distribution.dimensions.keys())
+        pk_filter           = ", ".join(f"'{pk}'" for pk in all_keys)
 
-        # Build SELECT clause to extract histogram arrays (stored as BIGINT[])
-        select_cols = ["partition_key"]
-        if "temperature" in dimensions_to_score:
-            select_cols.append(
-                "CAST(histogram_counts AS DOUBLE[]) AS temp_counts"
-            )
-        if "timestamp" in dimensions_to_score:
-            select_cols.append(
-                "CAST(timestamp_histogram_counts AS DOUBLE[]) AS ts_counts"
-            )
-        if "longitude" in dimensions_to_score:
-            select_cols.append(
-                "CAST(longitude_histogram_counts AS DOUBLE[]) AS lon_counts"
-            )
-        if "latitude" in dimensions_to_score:
-            select_cols.append(
-                "CAST(latitude_histogram_counts AS DOUBLE[]) AS lat_counts"
-            )
-
-        select_clause = ", ".join(select_cols)
-
-        # Build WHERE clause to ensure all requested histogram arrays are present
+        # ----------------------------------------------------------------
+        # Build the SQL query from DIMENSION_CATALOG in one pass.
+        # Each active dimension contributes three things:
+        #   • A SELECT column alias (histogram array cast to DOUBLE[])
+        #   • A WHERE IS NOT NULL guard
+        #   • A weight expression (list_aggregate over list_transform)
+        # ----------------------------------------------------------------
+        select_cols   = ["partition_key"]
         where_clauses = ["dataset_id = 'lst'", f"partition_key IN ({pk_filter})"]
-        if "temperature" in dimensions_to_score:
-            where_clauses.append("histogram_counts IS NOT NULL")
-        if "timestamp" in dimensions_to_score:
-            where_clauses.append("timestamp_histogram_counts IS NOT NULL")
-        if "longitude" in dimensions_to_score:
-            where_clauses.append("longitude_histogram_counts IS NOT NULL")
-        if "latitude" in dimensions_to_score:
-            where_clauses.append("latitude_histogram_counts IS NOT NULL")
+        weight_exprs  = []
 
-        where_clause = " AND ".join(where_clauses)
+        for dim in dimensions_to_score:
+            dim_meta = DIMENSION_CATALOG.get(dim)
+            if dim_meta is None:
+                log.warning("_select_partitions: unknown dimension '%s' — skipping", dim)
+                continue
 
-        # Build weight expressions for each dimension
-        weight_exprs = []
+            db_col    = dim_meta["col"]        # column name in partition_statistics
+            sql_alias = dim_meta["sql_alias"]  # short alias for this query
 
-        if "temperature" in dimensions_to_score:
-            temp_dim = self._distribution.dimensions["temperature"]
-            temp_edges = temp_dim.bin_edges
-            n_bins = len(temp_edges) - 1
+            # SELECT: cast the stored BIGINT[] to DOUBLE[] for arithmetic
+            select_cols.append(f"CAST({db_col} AS DOUBLE[]) AS {sql_alias}")
+
+            # WHERE: skip partitions where this histogram is NULL
+            where_clauses.append(f"{db_col} IS NOT NULL")
+
+            # Weight expression: proportion-overlap per bin, summed
+            dim_target = self._distribution.dimensions[dim]
+            bin_edges  = dim_target.bin_edges
+            n_bins     = len(bin_edges) - 1
+
+            # Build the dense target vector aligned to the histogram bins
             target_vec = [0.0] * n_bins
-            for edge, desired_prop in temp_dim.target.items():
-                bin_idx = min(
-                    range(n_bins),
-                    key=lambda i: abs(temp_edges[i] - edge),
-                )
-                target_vec[bin_idx] += desired_prop
+            for edge_val, desired_prop in dim_target.target.items():
+                bin_idx = dim_target._find_bin(edge_val)
+                if 0 <= bin_idx < n_bins:
+                    target_vec[bin_idx] += desired_prop
+
             target_json = json.dumps(target_vec)
+
             weight_exprs.append(f"""
                 list_aggregate(
                     list_transform(
-                        generate_series(0, len(temp_counts) - 1),
+                        generate_series(0, len({sql_alias}) - 1),
                         i -> CASE
-                            WHEN list_sum(temp_counts) = 0 THEN 0.0
+                            WHEN list_sum({sql_alias}) = 0 THEN 0.0
                             ELSE least(
-                                temp_counts[i + 1]::DOUBLE / list_sum(temp_counts),
+                                {sql_alias}[i + 1] / list_sum({sql_alias}),
                                 ({target_json}::DOUBLE[])[i + 1]
                             )
                         END
                     ),
                     'sum'
-                )
-            """)
+                )""")
 
-        if "timestamp" in dimensions_to_score:
-            ts_dim = self._distribution.dimensions["timestamp"]
-            ts_edges = ts_dim.bin_edges
-            n_bins = len(ts_edges) - 1
-            target_vec = [0.0] * n_bins
-            for edge, desired_prop in ts_dim.target.items():
-                bin_idx = min(
-                    range(n_bins),
-                    key=lambda i: abs(ts_edges[i] - edge),
-                )
-                target_vec[bin_idx] += desired_prop
-            target_json = json.dumps(target_vec)
-            weight_exprs.append(f"""
-                list_aggregate(
-                    list_transform(
-                        generate_series(0, len(ts_counts) - 1),
-                        i -> CASE
-                            WHEN list_sum(ts_counts) = 0 THEN 0.0
-                            ELSE least(
-                                ts_counts[i + 1]::DOUBLE / list_sum(ts_counts),
-                                ({target_json}::DOUBLE[])[i + 1]
-                            )
-                        END
-                    ),
-                    'sum'
-                )
-            """)
+        if not weight_exprs:
+            return [(pk, 1.0) for pk in sorted(all_keys)]
 
-        if "longitude" in dimensions_to_score:
-            lon_dim = self._distribution.dimensions["longitude"]
-            lon_edges = lon_dim.bin_edges
-            n_bins = len(lon_edges) - 1
-            target_vec = [0.0] * n_bins
-            for edge, desired_prop in lon_dim.target.items():
-                bin_idx = min(
-                    range(n_bins),
-                    key=lambda i: abs(lon_edges[i] - edge),
-                )
-                target_vec[bin_idx] += desired_prop
-            target_json = json.dumps(target_vec)
-            weight_exprs.append(f"""
-                list_aggregate(
-                    list_transform(
-                        generate_series(0, len(lon_counts) - 1),
-                        i -> CASE
-                            WHEN list_sum(lon_counts) = 0 THEN 0.0
-                            ELSE least(
-                                lon_counts[i + 1]::DOUBLE / list_sum(lon_counts),
-                                ({target_json}::DOUBLE[])[i + 1]
-                            )
-                        END
-                    ),
-                    'sum'
-                )
-            """)
-
-        if "latitude" in dimensions_to_score:
-            lat_dim = self._distribution.dimensions["latitude"]
-            lat_edges = lat_dim.bin_edges
-            n_bins = len(lat_edges) - 1
-            target_vec = [0.0] * n_bins
-            for edge, desired_prop in lat_dim.target.items():
-                bin_idx = min(
-                    range(n_bins),
-                    key=lambda i: abs(lat_edges[i] - edge),
-                )
-                target_vec[bin_idx] += desired_prop
-            target_json = json.dumps(target_vec)
-            weight_exprs.append(f"""
-                list_aggregate(
-                    list_transform(
-                        generate_series(0, len(lat_counts) - 1),
-                        i -> CASE
-                            WHEN list_sum(lat_counts) = 0 THEN 0.0
-                            ELSE least(
-                                lat_counts[i + 1]::DOUBLE / list_sum(lat_counts),
-                                ({target_json}::DOUBLE[])[i + 1]
-                            )
-                        END
-                    ),
-                    'sum'
-                )
-            """)
-
-        # Build the product of weights (one weight expression per dimension)
+        # Build the product of per-dimension weight expressions.
         if len(weight_exprs) == 1:
             weight_expr = weight_exprs[0]
         else:
-            # Product of all dimension weights
-            weight_expr = " * ".join(f"({expr})" for expr in weight_exprs)
+            weight_expr = " * ".join(f"({e})" for e in weight_exprs)
 
-        sql = f"""
-            WITH parsed AS (
-                SELECT {select_clause}
-                FROM partition_statistics
-                WHERE {where_clause}
-            ),
-            scored AS (
+        where_clause = " AND ".join(where_clauses)
+
+        # partition_statistics has one row per (partition_key, tile_id).
+        # Before scoring we must sum histogram arrays across all tiles of a
+        # partition; otherwise every tile is a separate result row and
+        # ORDER BY weight DESC locks onto the single highest-tile-count month,
+        # streaming it until max_rows is hit without ever visiting another month.
+        #
+        # Aggregation pattern (one CTE per dimension):
+        #   UNNEST each tile's BIGINT[] into (partition_key, bin_idx, count),
+        #   SUM counts by (partition_key, bin_idx),
+        #   re-aggregate into a DOUBLE[] ordered by bin_idx.
+        # The resulting arrays feed the weight_exprs unchanged.
+
+        agg_ctes  = []   # one per dimension
+        agg_joins = []   # JOIN onto the distinct partition_key list
+
+        for dim in dimensions_to_score:
+            dim_meta = DIMENSION_CATALOG.get(dim)
+            if dim_meta is None:
+                continue
+            db_col    = dim_meta["col"]
+            sql_alias = dim_meta["sql_alias"]
+            cte_name  = f"_agg_{sql_alias}"
+
+            agg_ctes.append(f"""
+        {cte_name} AS (
+            SELECT
+                partition_key,
+                array_agg(bin_sum::DOUBLE ORDER BY bin_idx) AS {sql_alias}
+            FROM (
                 SELECT
                     partition_key,
-                    {weight_expr} AS weight
-                FROM parsed
+                    idx - 1            AS bin_idx,
+                    SUM({db_col}[idx]) AS bin_sum
+                FROM partition_statistics,
+                     generate_series(1, len({db_col})) AS t(idx)
+                WHERE dataset_id = 'lst'
+                  AND partition_key IN ({pk_filter})
+                  AND {db_col} IS NOT NULL
+                GROUP BY partition_key, idx
+            )
+            GROUP BY partition_key
+        )""")
+            agg_joins.append(
+                f"LEFT JOIN {cte_name} USING (partition_key)"
+            )
+
+        agg_cte_block = ",\n".join(agg_ctes)
+        joins_block   = "\n            ".join(agg_joins)
+
+        sql = f"""
+            WITH
+            _pks AS (
+                SELECT DISTINCT partition_key
+                FROM partition_statistics
+                WHERE dataset_id = 'lst'
+                  AND partition_key IN ({pk_filter})
+            ),
+            {agg_cte_block},
+            _scored AS (
+                SELECT _pks.partition_key, {weight_expr} AS weight
+                FROM _pks
+                {joins_block}
             )
             SELECT partition_key, weight
-            FROM scored
+            FROM _scored
             WHERE weight > 0
             ORDER BY weight DESC
         """
+        
+        # Check how many partitions the catalog actually loaded
+        log.info("_select_partitions: %d partition_keys, scoring dims: %s",
+                len(all_keys), dimensions_to_score)
+
+        # Check what columns actually exist in partition_statistics
+        cols = self._catalog_conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'partition_statistics'"
+        ).fetchall()
+        log.info("_select_partitions: partition_statistics columns = %s",
+                [c[0] for c in cols])
 
         t0 = time.perf_counter()
         rows = self._catalog_conn.execute(sql).fetchall()
-        log.info("catalog: partition scoring done in %.3fs (%d partitions) "
-                 "using dimensions: %s",
-                 time.perf_counter() - t0, len(rows), dimensions_to_score)
+
+        t0 = time.perf_counter()
+        rows = self._catalog_conn.execute(sql).fetchall()
+        log.info(
+            "catalog: partition scoring done in %.3fs (%d partitions) "
+            "dimensions: %s",
+            time.perf_counter() - t0, len(rows), dimensions_to_score,
+        )
         return [(r[0], r[1]) for r in rows]
 
     def stream(
@@ -1059,12 +1124,24 @@ class StreamConfig:
           Inner - one tick per batch within the current partition, postfix
                   shows per-feature timing once the first batch completes.
 
-        Early stopping
-        --------------
-        Stops immediately once max_rows is reached.  When a distribution
-        target is set, partitions are ordered by weight descending so the
-        highest-value data comes first - set max_rows to collect a well-
-        distributed sample without streaming the full dataset.
+        Early stopping and row quotas
+        ------------------------------
+        When max_rows is set without a distribution, rows are streamed
+        sequentially and stopped once max_rows is reached.
+
+        When max_rows is set WITH a distribution target, each partition
+        receives a row_quota proportional to its weight:
+
+            quota_i = floor(weight_i / sum(weights) * max_rows)
+
+        Leftover rows (from floor rounding) are assigned to the
+        highest-weight partitions first.  Each partition cursor is issued
+        with "LIMIT quota_i" so it never reads more than its share.
+        This is the mechanism that actually enforces the target distribution
+        rather than just ordering partitions.
+
+        Without max_rows the distribution only orders partitions; all rows
+        from every partition are yielded in weight-descending order.
         """
         if registry is None:
             registry = FeatureRegistry()
@@ -1085,6 +1162,41 @@ class StreamConfig:
         if not partitions:
             log.warning("stream: no partitions selected - nothing to stream")
             return
+
+        # ---- Compute per-partition row quotas --------------------------------
+        # When max_rows is set and a distribution is active, enforce the
+        # distribution by limiting each partition to its proportional share.
+        # Without a distribution (all weights == 1.0) fall back to the original
+        # behaviour: stream sequentially and stop at max_rows.
+        has_distribution = (
+            self._distribution is not None
+            and bool(self._distribution.dimensions)
+        )
+        if max_rows is not None and has_distribution:
+            total_weight = sum(w for _, w in partitions)
+            if total_weight <= 0:
+                total_weight = 1.0
+            # Floor allocation
+            raw_quotas    = [int((w / total_weight) * max_rows) for _, w in partitions]
+            allocated     = sum(raw_quotas)
+            leftover      = max_rows - allocated
+            # Distribute leftover to highest-weight partitions first
+            order         = sorted(range(len(partitions)), key=lambda i: partitions[i][1], reverse=True)
+            for i in range(leftover):
+                raw_quotas[order[i % len(order)]] += 1
+            # Map partition_key → quota; skip partitions with quota 0
+            partition_quotas = {
+                pk: q for (pk, _), q in zip(partitions, raw_quotas) if q > 0
+            }
+            log.info(
+                "stream: quota mode — %d partitions, %d total allocated rows "
+                "(target %d), non-zero: %d",
+                len(partitions), sum(partition_quotas.values()),
+                max_rows, len(partition_quotas),
+            )
+        else:
+            # Sequential mode: no per-partition caps
+            partition_quotas = None
 
         lst_meta = self._catalog_meta.get("lst", {})
         lst_db   = self.prepared / lst_meta.get("db_file", "lst.duckdb")
@@ -1132,39 +1244,63 @@ class StreamConfig:
                 if stop_early:
                     break
 
+                # Skip partitions that received zero quota allocation
+                if partition_quotas is not None and partition_key not in partition_quotas:
+                    continue
+
                 part_t0   = time.perf_counter()
                 part_rows = 0
+
+                # Row cap for this partition:
+                #   quota mode → fixed allocation
+                #   sequential mode → remainder of global max_rows budget
+                if partition_quotas is not None:
+                    part_limit = partition_quotas[partition_key]
+                elif max_rows is not None:
+                    part_limit = max_rows - session_rows
+                    if part_limit <= 0:
+                        stop_early = True
+                        break
+                else:
+                    part_limit = None   # no cap — read the full partition
 
                 part_bar.set_postfix({
                     "pk":      partition_key,
                     "weight":  f"{weight:.3f}",
+                    "quota":   f"{part_limit:,}" if part_limit is not None else "all",
                     "yielded": f"{session_rows:,}",
                 }, refresh=True)
 
-                log.info("partition %s [%d/%d] (w=%.3f): executing LST cursor",
-                         partition_key, part_idx + 1, len(partitions), weight)
+                log.debug("partition %s [%d/%d] (w=%.3f, limit=%s): opening cursor",
+                          partition_key, part_idx + 1, len(partitions), weight,
+                          part_limit if part_limit is not None else "∞")
 
                 # Estimate batch count BEFORE opening the streaming cursor.
-                # Executing any query on lst_conn while the streaming cursor is
-                # open replaces the active DuckDB result set, causing fetchmany
-                # to return [] immediately.  The COUNT must complete first.
+                # Any query on lst_conn while the cursor is open would replace
+                # the active DuckDB result set, making fetchmany return [].
                 est_batches = None
-                try:
-                    n_part = lst_conn.execute(
-                        "SELECT COUNT(*) FROM lst WHERE partition_key = ?",
-                        [partition_key]
-                    ).fetchone()[0]
-                    est_batches = max(1, (n_part + bs - 1) // bs)
-                    log.debug("partition %s: ~%d rows, ~%d batches",
-                              partition_key, n_part, est_batches)
-                except Exception:
-                    pass
+                if part_limit is not None:
+                    est_batches = max(1, (part_limit + bs - 1) // bs)
+                else:
+                    try:
+                        n_part = lst_conn.execute(
+                            "SELECT COUNT(*) FROM lst WHERE partition_key = ?",
+                            [partition_key]
+                        ).fetchone()[0]
+                        est_batches = max(1, (n_part + bs - 1) // bs)
+                        log.debug("partition %s: ~%d rows, ~%d batches",
+                                  partition_key, n_part, est_batches)
+                    except Exception:
+                        pass
 
+                # Build the cursor SQL — add LIMIT when a cap is set so DuckDB
+                # reads only the required rows from disk.
+                limit_sql = f" LIMIT {part_limit}" if part_limit is not None else ""
                 cursor = lst_conn.execute(
                     "SELECT longitude, latitude, aster_lst, modis_lst, ndvi, "
-                    "       image_id, timestamp, partition_key, tile_id "
-                    "FROM lst "
-                    "WHERE partition_key = ?",
+                    "       image_id, timestamp, partition_key, tile_id, "
+                    "       year, month_of_year, day_of_month, day_of_year, hour_of_day "
+                    f"FROM lst WHERE partition_key = ?{limit_sql}",
                     [partition_key],
                 )
                 log.debug("partition %s: cursor ready in %.3fs",
@@ -1184,8 +1320,11 @@ class StreamConfig:
 
                 try:
                     while True:
-                        # Respect max_rows before fetching
-                        if max_rows is not None:
+                        # In quota mode the LIMIT on the cursor already caps how
+                        # many rows this partition contributes; we just read until
+                        # the cursor is exhausted.  In sequential mode we still
+                        # need to honour the global max_rows budget.
+                        if partition_quotas is None and max_rows is not None:
                             remaining = max_rows - session_rows
                             if remaining <= 0:
                                 stop_early = True
@@ -1239,13 +1378,21 @@ class StreamConfig:
                             feat_elapsed = time.perf_counter() - t_feat
                             if first_batch_feat_time is None:
                                 first_batch_feat_time = feat_elapsed
-                                log.info("partition %s batch %d: first feature batch "
-                                         "in %.2fs - cols: %s",
-                                         partition_key, batch_num, feat_elapsed,
-                                         [c for c in out_cols_data
-                                          if c not in FeatureRow._fields])
+                                log.debug("partition %s batch %d: first feature batch "
+                                          "in %.2fs - cols: %s",
+                                          partition_key, batch_num, feat_elapsed,
+                                          [c for c in out_cols_data
+                                           if c not in FeatureRow._fields])
+                            
 
-                            result_df = pd.DataFrame(out_cols_data)
+
+                            try:
+                                result_df = pd.DataFrame(out_cols_data)
+                            except:
+                                log.error("partition %s batch %d: error creating result DataFrame",
+                                          partition_key, batch_num, exc_info=True)
+                                log.error(f"out_cols_data={out_cols_data}")
+                                raise
                             yield result_df
                             n_yielded = len(result_df)
 
@@ -1270,6 +1417,10 @@ class StreamConfig:
                             "r/s":     f"{throughput:,.0f}",
                         }, refresh=False)
 
+                        # In sequential mode (no quotas), stop as soon as the
+                        # global max_rows budget is exhausted.
+                        # In quota mode the LIMIT on the cursor handles capping;
+                        # stop_early is only set if somehow session_rows overshoots.
                         if max_rows is not None and session_rows >= max_rows:
                             stop_early = True
                             break
@@ -1279,8 +1430,8 @@ class StreamConfig:
 
                 part_elapsed = time.perf_counter() - part_t0
                 part_rps     = part_rows / part_elapsed if part_elapsed > 0 else 0
-                log.info("partition %s: done - %d rows in %.1fs (%.0f rows/s)",
-                         partition_key, part_rows, part_elapsed, part_rps)
+                log.debug("partition %s: done - %d rows in %.1fs (%.0f rows/s)",
+                          partition_key, part_rows, part_elapsed, part_rps)
 
                 if stop_early:
                     log.info("stream: early stop after %d rows (max_rows=%s)",

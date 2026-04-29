@@ -6,7 +6,7 @@ Generate an interactive HTML report from catalog.duckdb.
 The report contains:
   - Dataset metadata table
   - Total histograms (temperature, timestamp, lon, lat) aggregated across
-    all partition_keys and tiles. Temperature = COALESCE(aster_lst, modis_lst) — first non-null LST value
+    all partition_keys and tiles. Temperature = COALESCE(aster_lst, modis_lst) - first non-null LST value
     across ASTER and MODIS. NDVI is a vegetation index (unitless, −1 to +1)
     used as an emissivity correction input, not a temperature fallback.
   - Per-partition_key histograms: one set of 4 histograms per month,
@@ -26,7 +26,7 @@ be used as a temperature fallback.
 Performance notes
 -----------------
 All histogram aggregation is pushed into DuckDB via array_aggregate(..., 'sum')
-GROUP BY queries. Python never iterates over raw tile rows — it only receives
+GROUP BY queries. Python never iterates over raw tile rows - it only receives
 one pre-summed row per partition_key and one per tile_id. This reduces the
 Python-side work from O(N_tiles * N_bins) to O(N_groups * N_bins).
 
@@ -86,7 +86,7 @@ _HIST_DB_COLS = [
     "latitude_histogram_counts",
 ]
 
-# NOTE: array_aggregate(col, 'sum') sums ALL elements to a single scalar —
+# NOTE: array_aggregate(col, 'sum') sums ALL elements to a single scalar -
 # it does NOT do an element-wise (per-bin) sum across rows.
 # The correct approach is: unnest each array with its bin index, sum per bin,
 # then re-collect into a list. The helper below generates that CTE pattern
@@ -194,7 +194,7 @@ SUBPLOT_TITLES = [v[1] for v in HIST_COLS.values()]
 def _counts_from_agg_row(agg_row: tuple, col_offset: int) -> list[int]:
     """
     Extract counts list from a pre-aggregated row returned by _fetch_by_*.
-    agg_row is (hist0, hist1, hist2, hist3) — the non-key tail of the DB row.
+    agg_row is (hist0, hist1, hist2, hist3) - the non-key tail of the DB row.
     Uses NumPy for the (rare) case where multiple raw rows were summed in Python;
     here it's mostly a passthrough since DuckDB already summed everything.
     """
@@ -287,7 +287,7 @@ def _make_dropdown_figure(
     """
     4-panel figure with a dropdown to switch between groups.
     groups: list of (label, agg_row) where agg_row is a pre-summed tuple
-            (hist0, hist1, hist2, hist3) — no raw rows, no Python aggregation.
+            (hist0, hist1, hist2, hist3) - no raw rows, no Python aggregation.
     """
     fig = make_subplots(
         rows=2, cols=2,
@@ -320,13 +320,13 @@ def _make_dropdown_figure(
             method="update",
             args=[
                 {"visible": vis},
-                {"title": {"text": f"{title} — {label}"}},
+                {"title": {"text": f"{title} - {label}"}},
             ],
         ))
 
     first_label = groups[0][0] if groups else ""
     fig.update_layout(
-        title_text=f"{title} — {first_label}<br><sub>Temperature = COALESCE(aster_lst, modis_lst)  |  NDVI = vegetation index (emissivity input, not LST)</sub>",
+        title_text=f"{title} - {first_label}<br><sub>Temperature = COALESCE(aster_lst, modis_lst)  |  NDVI = vegetation index (emissivity input, not LST)</sub>",
         title_font_size=13,
         updatemenus=[dict(
             buttons=buttons,
@@ -457,7 +457,7 @@ def _make_stats_table(conn: duckdb.DuckDBPyConnection) -> go.Figure:
     fig.update_layout(
         title_text=(
             "Partition Summary (LST)<br>"
-            "<sub>* Temperature = COALESCE(aster_lst, modis_lst) — first non-null LST across ASTER/MODIS. "
+            "<sub>* Temperature = COALESCE(aster_lst, modis_lst) - first non-null LST across ASTER/MODIS. "
             "NDVI is a vegetation index (emissivity input) and is not included in this fallback.</sub>"
         ),
         title_font_size=14,

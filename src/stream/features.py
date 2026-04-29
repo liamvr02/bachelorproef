@@ -8,6 +8,10 @@ Public API:
   FeatureRegistry                             - container for all registered feature descriptors
   nearest()                                   - factory: nearest point in a dataset
   aggregate_in_radius()                       - factory: aggregated points within radius
+                                                  (supports attr_filter for per-category counts and
+                                                   aanlegjaar_lte_scene for DiD treatment dose)
+  trees_count_planted_by()                    - factory: count of trees with known aanlegjaar
+                                                  already planted by scene_year (DiD treatment)
   urban_atlas_luc_fraction()                  - factory: UA polygon fraction (single LUC code)
   urban_atlas_classifications_fractions()     - factory: UA polygon fractions (semantic classifications)
   wis_fraction()                              - factory: WIS polygon fraction
@@ -35,14 +39,15 @@ from __future__ import annotations
 import logging
 import time
 from collections import namedtuple
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
+from narwhals import col
 import numpy as np
 import pandas as pd
 
-from connections import Connections
-from poly_raster import _PolyRaster
-from queries import (
+from stream.connections import Connections
+from stream.poly_raster import _PolyRaster
+from stream.queries import (
     batch_nearest, batch_radius,
     batch_urban_atlas_luc_fraction, batch_wis_fraction,
     query_nearest, query_radius,
@@ -57,8 +62,18 @@ log = logging.getLogger("stream")
 # ---------------------------------------------------------------------------
 FeatureRow = namedtuple(
     "FeatureRow",
-    ["longitude", "latitude", "aster_lst", "modis_lst", "ndvi",
-     "image_id", "timestamp", "partition_key", "tile_id"],
+    [
+        "longitude", "latitude", "aster_lst", "modis_lst", "ndvi",
+        "image_id", "timestamp", "partition_key", "tile_id",
+        # Pre-computed time components — derived from timestamp at ingest time.
+        # Available as direct numeric fields for custom feature callables,
+        # and included in every yielded DataFrame batch.
+        "year",           # calendar year (int)
+        "month_of_year",  # month 1–12 (int)
+        "day_of_month",   # day within month 1–31 (int)
+        "day_of_year",    # day within year 1–366 (int)
+        "hour_of_day",    # fractional UTC hour 0.0–24.0 (float)
+    ],
 )
 
 
@@ -86,6 +101,9 @@ class _FeatureDescriptor:
         "_classification_map",             # UA multi-code (classifications) field
         "_attr_col", "_attr_val",          # WIS fields
         "_radius_m",                       # shared
+        # Output-column metadata — populated by factories that produce a fixed
+        # set of bounded outputs, consumed by FeatureRegistry.column_scaler_hints().
+        "_output_columns", "_value_range", "_scaler_hint",
     )
 
     def __init__(
@@ -99,6 +117,9 @@ class _FeatureDescriptor:
         self.prefix    = prefix
         self._batch_fn = batch_fn
         self._row_fn   = row_fn
+        self._output_columns: Optional[List[str]]            = None
+        self._value_range:    Optional[Tuple[float, float]]  = None
+        self._scaler_hint:    Optional[str]                  = None
 
     @property
     def is_batchable(self) -> bool:
@@ -134,7 +155,7 @@ class FeatureRegistry:
     Usage
     -----
         reg = FeatureRegistry()
-        reg.add(nearest("dhm1", ["elevation"], temporal="last_previous"))
+        reg.add(nearest("dhm", ["elevation"], temporal="last_previous"))
         reg.add(aggregate_in_radius("trees", 50, [], agg="count"))
         reg.add_custom(my_fn, name="my_feature")
     """
@@ -186,8 +207,10 @@ class FeatureRegistry:
             t0 = time.perf_counter()
             try:
                 result = desc.compute_batch(df, conns)
-                log.info("batch_feature '%s': %.3fs -> cols %s",
-                         desc.name, time.perf_counter() - t0, list(result.columns))
+
+
+                log.debug("batch_feature '%s': %.3fs -> cols %s",
+                          desc.name, time.perf_counter() - t0, list(result.columns))
                 parts.append(result)
             except Exception as exc:
                 log.error("batch_feature '%s': FAILED in %.3fs - %s",
@@ -224,6 +247,22 @@ class FeatureRegistry:
                     col_arrays[k][i] = v
         return pd.DataFrame(col_arrays)
 
+    def column_scaler_hints(self) -> Dict[str, str]:
+        """
+        Return {output_column: scaler_name} for every descriptor that exposes a
+        scaler hint via metadata.  Used by ``train_all`` to auto-select
+        MinMaxScaler on bounded fraction features so SGD doesn't see z-scores
+        like 50 on rare-nonzero columns.
+        """
+        hints: Dict[str, str] = {}
+        for d in self._descriptors:
+            cols = getattr(d, "_output_columns", None)
+            hint = getattr(d, "_scaler_hint", None)
+            if cols and hint:
+                for c in cols:
+                    hints[c] = hint
+        return hints
+
     def __len__(self) -> int:
         return len(self._descriptors)
 
@@ -244,7 +283,7 @@ def nearest(
 
     Parameters
     ----------
-    dataset_id : registered dataset (e.g. "dhm1", "ndvi")
+    dataset_id : registered dataset (e.g. "dhm", "ndvi")
     columns    : which columns to return from the nearest row
     temporal   : "none"          - ignore timestamps (static datasets)
                  "last_previous" - most recent observation with ts <= driving_ts
@@ -256,7 +295,7 @@ def nearest(
     --------------
     Issues one batch spatial JOIN per feature per batch, not one query per row.
     Custom callables can reuse the row-level helper:
-        result = query_nearest(conns, "dhm1", row.longitude, row.latitude,
+        result = query_nearest(conns, "dhm", row.longitude, row.latitude,
                                row.timestamp, ["elevation"], temporal="nearest")
     """
     if temporal not in ("none", "last_previous", "nearest"):
@@ -287,6 +326,8 @@ def aggregate_in_radius(
     agg: str = "count",
     temporal: str = "none",
     prefix: str = "",
+    attr_filter: Optional[Dict[str, str]] = None,
+    aanlegjaar_lte_scene: bool = False,
 ) -> _FeatureDescriptor:
     """
     Factory: aggregate all points within *radius_m* metres of each driving pixel.
@@ -299,6 +340,13 @@ def aggregate_in_radius(
     agg        : "count", "avg", "sum", "min", or "max"
     temporal   : same as nearest()
     prefix     : optional column name prefix
+    attr_filter: optional equality predicates, e.g. ``{"beheerfase": "Jeugdfase"}``
+                 — appended as ``AND col = 'val'`` to the radius query.  Used to
+                 produce per-category counts (juvenile/mature/veteran/unknown).
+    aanlegjaar_lte_scene : trees-only treatment-dose filter.  When True,
+                 restrict to rows with ``aanlegjaar IS NOT NULL AND
+                 aanlegjaar <= year(scene_ts)``.  This is the staggered-DiD
+                 dose: trees that were already planted by each LST scene.
 
     Implementation
     --------------
@@ -314,22 +362,74 @@ def aggregate_in_radius(
     if temporal not in ("none", "last_previous", "nearest"):
         raise ValueError(f"temporal must be 'none', 'last_previous' or 'nearest', got {temporal!r}")
 
-    _prefix = prefix or f"{dataset_id}_{agg}{int(radius_m)}m_"
+    # Compute name_suffix first so it can be incorporated into the auto-generated
+    # prefix, ensuring filtered descriptors produce unique output column names.
+    name_suffix = ""
+    if attr_filter:
+        name_suffix += "_" + "_".join(
+            f"{k}={str(v).replace(' ', '_')}" for k, v in attr_filter.items()
+        )
+    if aanlegjaar_lte_scene:
+        name_suffix += "_plantedby"
+
+    # If the caller supplied an explicit prefix, use it as-is; otherwise build
+    # one that includes the filter suffix so output columns are always unique.
+    _prefix = prefix or f"{dataset_id}_{agg}{int(radius_m)}m{name_suffix}_"
 
     def _batch(df: pd.DataFrame, conns: Connections) -> pd.DataFrame:
-        return batch_radius(df, conns, dataset_id, columns, agg, temporal, radius_m)
+        return batch_radius(
+            df, conns, dataset_id, columns, agg, temporal, radius_m,
+            attr_filter=attr_filter,
+            aanlegjaar_lte_scene=aanlegjaar_lte_scene,
+        )
 
     def _row(row: FeatureRow, conns: Connections) -> dict:
         return query_radius(conns, dataset_id,
                             row.longitude, row.latitude, row.timestamp,
                             radius_m=radius_m, columns=columns,
-                            agg=agg, temporal=temporal)
+                            agg=agg, temporal=temporal,
+                            attr_filter=attr_filter,
+                            aanlegjaar_lte_scene=aanlegjaar_lte_scene)
 
     return _FeatureDescriptor(
-        name=f"radius_{dataset_id}_{agg}_{int(radius_m)}m_{temporal}",
+        name=f"radius_{dataset_id}_{agg}_{int(radius_m)}m_{temporal}{name_suffix}",
         prefix=_prefix,
         batch_fn=_batch,
         row_fn=_row,
+    )
+
+
+def trees_count_planted_by(
+    radius_m: float,
+    prefix: str = "",
+) -> _FeatureDescriptor:
+    """
+    Factory: count of trees within *radius_m* whose ``aanlegjaar`` is known
+    and <= year(scene_ts).  This is the staggered-DiD treatment dose.
+
+    Output column
+    -------------
+    ``trees_plantedby_{radius_m}m_count`` (default prefix
+    ``trees_plantedby_{radius_m}m_``).  The radius is baked into the prefix
+    so multiple radii can be registered side-by-side without column collision.
+
+    Notes
+    -----
+    Only ~27% of Ghent trees have a known ``aanlegjaar``, so this count
+    excludes ~73% of physical trees.  That selection is intentional for DiD:
+    we need treatment-timing variation, which only exists when ``aanlegjaar``
+    is observed.  The complementary count (trees with NULL ``aanlegjaar``)
+    can be obtained via ``aggregate_in_radius("trees", agg="count")``.
+    """
+    _prefix = prefix or f"trees_plantedby_{int(radius_m)}m_"
+    return aggregate_in_radius(
+        dataset_id="trees",
+        radius_m=radius_m,
+        columns=[],
+        agg="count",
+        temporal="none",
+        prefix=_prefix,
+        aanlegjaar_lte_scene=True,
     )
 
 
@@ -398,6 +498,9 @@ def urban_atlas_luc_fraction(
     desc._luc_code     = luc_code
     desc._radius_m     = radius_m
     desc._ua_year      = ua_year
+    desc._output_columns = [f"{_prefix}{out_col}"]
+    desc._value_range    = (0.0, 1.0)
+    desc._scaler_hint    = "minmax"
     return desc
 
 
@@ -552,6 +655,14 @@ def urban_atlas_classifications_fractions(
     desc._classification_map = norm_map
     desc._radius_m          = radius_m
     desc._ua_year           = ua_year
+    # Names mirror what compute_batch produces: the inner _batch builds keys
+    # already prefixed with _prefix, then compute_batch prefixes again.
+    desc._output_columns    = [
+        f"{_prefix}{_prefix}{cls}_{int(radius_m)}m_frac"
+        for cls in norm_map
+    ]
+    desc._value_range       = (0.0, 1.0)
+    desc._scaler_hint       = "minmax"
     return desc
 
 
@@ -621,4 +732,7 @@ def wis_fraction(
     desc._attr_col     = attr_col
     desc._attr_val     = attr_val
     desc._radius_m     = radius_m
+    desc._output_columns = [f"{_prefix}{out_col}"]
+    desc._value_range    = (0.0, 1.0)
+    desc._scaler_hint    = "minmax"
     return desc

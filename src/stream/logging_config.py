@@ -46,19 +46,36 @@ def configure_logging(level: str = "INFO", log_dir: str = "logs") -> None:
         datefmt="%H:%M:%S",
     )
 
-    root = logging.getLogger("stream")
+    # Attach handlers to the *root* logger so that every named logger
+    # (stream, lst_models.*, ingest.*, third-party) inherits the tqdm-safe
+    # console handler.  Without this, anything outside the "stream" tree
+    # logs straight to stderr and clobbers active tqdm bars.
+    root = logging.getLogger()
     root.setLevel(numeric)
 
-    # Avoid duplicate handlers if called multiple times
-    if not root.handlers:
-        # Console (tqdm-safe)
+    # Drop the legacy "stream"-only handlers so log records aren't emitted
+    # twice (once via the stream logger, once via root after propagation).
+    stream_logger = logging.getLogger("stream")
+    for h in list(stream_logger.handlers):
+        stream_logger.removeHandler(h)
+    stream_logger.propagate = True
+
+    has_tqdm  = any(isinstance(h, _TqdmHandler)        for h in root.handlers)
+    has_file  = any(isinstance(h, logging.FileHandler) for h in root.handlers)
+
+    if not has_tqdm:
         console_handler = _TqdmHandler()
         console_handler.setFormatter(formatter)
         root.addHandler(console_handler)
 
-        # File handler
+    if not has_file:
         file_handler = logging.FileHandler(logfile, mode="w", encoding="utf-8")
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
-        root.info(f"Logging initialized -> {logfile}")
+    # Quiet noisy third-party libraries that would otherwise flood DEBUG runs.
+    for noisy in ("matplotlib", "PIL", "urllib3", "fiona", "pyogrio",
+                  "rasterio", "shapely", "numexpr"):
+        logging.getLogger(noisy).setLevel(max(numeric, logging.INFO))
+
+    root.info(f"Logging initialized -> {logfile}")

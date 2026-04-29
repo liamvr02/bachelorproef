@@ -109,7 +109,7 @@ def iter_raster_blocks(
             xs, ys, vals = xs[mask], ys[mask], vals[mask]
 
             if transformer is not None:
-                xs, ys = transformer.transform(xs, ys)   # → (lon, lat)
+                xs, ys = transformer.transform(xs, ys)   # -> (lon, lat)
 
             yield pd.DataFrame({"longitude": xs, "latitude": ys, "value": vals})
 
@@ -139,7 +139,7 @@ def iter_raster_blocks_masked(
     value_dtype   : numpy dtype to cast raster values to
     skip_zeros    : drop pixels where value == 0
     already_wgs84 : if True, pixel centres are used directly as lon/lat
-    transformer   : pyproj.Transformer for reprojection (raster CRS → WGS-84)
+    transformer   : pyproj.Transformer for reprojection (raster CRS -> WGS-84)
     """
     if not isinstance(mask_shapes, list):
         mask_shapes = [mask_shapes]
@@ -151,7 +151,7 @@ def iter_raster_blocks_masked(
         # If raster CRS differs from WGS-84, transform mask shapes to match raster CRS
         mask_shapes_for_clip = mask_shapes
         if raster_crs and str(raster_crs) != "EPSG:4326":
-            log.debug(f"Raster {tif_path.name} CRS: {raster_crs} — transforming mask shapes from WGS-84")
+            log.debug(f"Raster {tif_path.name} CRS: {raster_crs} - transforming mask shapes from WGS-84")
             # Polygon is in WGS-84; transform to raster CRS for masking
             wgs84_to_raster = Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
             mask_shapes_for_clip = [
@@ -159,7 +159,7 @@ def iter_raster_blocks_masked(
                 for poly in mask_shapes
             ]
         elif not raster_crs:
-            log.warning(f"Raster {tif_path.name} has no CRS metadata — assuming WGS-84")
+            log.warning(f"Raster {tif_path.name} has no CRS metadata - assuming WGS-84")
 
         # Use rasterio.mask to efficiently clip raster to polygon bounds at GDAL level.
         # Returns array and updated transform.
@@ -195,7 +195,7 @@ def iter_raster_blocks_masked(
         xs, ys, vals = xs[mask], ys[mask], vals[mask]
 
         if transformer is not None:
-            xs, ys = transformer.transform(xs, ys)   # → (lon, lat)
+            xs, ys = transformer.transform(xs, ys)   # -> (lon, lat)
 
         yield pd.DataFrame({"longitude": xs, "latitude": ys, "value": vals})
 
