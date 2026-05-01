@@ -45,7 +45,7 @@ from stream.features import (
     wis_fraction,
 )
 from stream.logging_config import configure_logging
-from stream.stream import StreamConfig
+from stream_configs.presets import all_rows
 
 
 _FAST_MODELS = ["huber", "linear", "ridge", "elastic_net", "sgd", "nystroem_sgd"]
@@ -157,7 +157,7 @@ def main() -> int:
 
     # ---- Eval slice: stream a small dedicated chunk to drive check_predictions ----
     eval_cap = max(args.batch, int((rows or 200_000) * 0.10))
-    eval_cfg = StreamConfig(batch_size=args.batch)
+    eval_cfg = all_rows(batch_size=args.batch)
     eval_batches: List[pd.DataFrame] = []
     bar = tqdm(total=eval_cap, desc="stream:eval", unit="row")
     for df in eval_cfg.stream(reg, batch_size=args.batch, max_rows=eval_cap):
@@ -180,7 +180,7 @@ def main() -> int:
     chosen = [m.strip() for m in args.models.split(",") if m.strip()]
 
     train_max = (rows - len(ev)) if rows is not None else None
-    train_cfg = StreamConfig(batch_size=args.batch)
+    train_cfg = all_rows(batch_size=args.batch)
 
     t0 = time.perf_counter()
     results = train_all(

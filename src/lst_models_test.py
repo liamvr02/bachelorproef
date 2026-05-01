@@ -32,7 +32,7 @@ from stream.features import (
     wis_fraction,
 )
 from stream.logging_config import configure_logging
-from stream.stream import StreamConfig
+from stream_configs.presets import all_rows
 
 _SRC      = Path(__file__).parent
 _REPORTS  = _SRC / "reports"
@@ -115,12 +115,11 @@ def main() -> int:
         # Streaming source — train_all handles fit_stream end-to-end.
         # Hold back ~5% of the cap (or one batch, whichever is larger) for eval.
         eval_cap_rows = max(args.batch, int((rows or 200_000) * 0.05))
-        cfg = StreamConfig(batch_size=args.batch)
+        cfg = all_rows(batch_size=args.batch)
 
-        # Stream a small dedicated eval set first (a separate StreamConfig so it
-        # doesn't consume the training stream).  For unbounded --rows we just
-        # take eval_cap_rows from the same partitions.
-        eval_cfg = StreamConfig(batch_size=args.batch)
+        # Stream a small dedicated eval set first (separate config so it
+        # doesn't consume the training stream).
+        eval_cfg = all_rows(batch_size=args.batch)
         reg      = build_registry()
 
         eval_batches: List[pd.DataFrame] = []
