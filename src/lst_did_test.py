@@ -52,7 +52,7 @@ from stream.features import (
     urban_atlas_classifications_fractions,
 )
 from stream.logging_config import configure_logging
-from stream.stream import StreamConfig
+from stream_configs.presets import all_rows
 
 _SRC     = Path(__file__).parent
 _REPORTS = _SRC / "reports"
@@ -72,18 +72,6 @@ def build_registry(radii: List[int]) -> FeatureRegistry:
         classification_map=UA, radius_m=100,
     ))
     return reg
-
-
-# ---------------------------------------------------------------------------
-# Stream config — natural distribution, no outlier exclusion
-# ---------------------------------------------------------------------------
-def build_stream(batch_size: int) -> StreamConfig:
-    """
-    DiD wants the full natural temporal density per tile, not a uniform
-    year/month/hour resampling — uniform sampling would shred the per-tile
-    panel and weaken FE identification.
-    """
-    return StreamConfig(batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +101,9 @@ def main() -> int:
 
     radii: List[int] = list(args.radius)
     reg = build_registry(radii)
-    cfg = build_stream(args.batch)
+    # DiD needs the natural temporal density per tile — no uniform resampling,
+    # which would shred the per-tile panel and weaken FE identification.
+    cfg = all_rows(batch_size=args.batch)
 
     print(f"\n[lst_did_test] DiD radii: {radii}")
     print(f"[lst_did_test] streaming up to {args.rows:,} rows in {args.batch:,}-row batches")

@@ -54,7 +54,6 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
@@ -67,7 +66,6 @@ from ml.base import NEVER_FEATURES
 from ml.registry import ModelRegistry
 from ml.transforms import remove
 from stream.classification_groups import UA, WIS_BESTEMMING, WIS_MATERIAAL
-from stream.config import get_dimension_edges
 from stream.features import (
     FeatureRegistry,
     aggregate_in_radius,
@@ -76,6 +74,8 @@ from stream.features import (
 )
 from stream.logging_config import configure_logging
 from stream.stream import StreamConfig
+from stream_configs.outliers import outlier_keys
+from stream_configs.presets import representative
 
 
 _SRC      = Path(__file__).parent
@@ -83,45 +83,6 @@ _REPORTS  = _SRC / "reports"
 _CACHE    = _SRC / "stream_cache" / "grid_search"
 _REPORTS.mkdir(exist_ok=True)
 _CACHE.mkdir(parents=True, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Outlier date ranges (mirrored from lst_full_test.py)
-# ---------------------------------------------------------------------------
-
-OUTLIER_RANGES: List[Tuple[date, date, str]] = [
-    (date(2006, 6, 1),  date(2006, 9, 1),  "heat_2006_summer"),
-    (date(2007, 4, 1),  date(2007, 5, 1),  "warm_2007_apr"),
-    (date(2010, 1, 1),  date(2010, 3, 1),  "cold_2010_winter"),
-    (date(2012, 2, 1),  date(2012, 3, 1),  "cold_2012_feb"),
-    (date(2013, 7, 1),  date(2013, 9, 1),  "heat_2013_summer"),
-    (date(2015, 7, 1),  date(2015, 9, 1),  "heat_2015_summer"),
-    (date(2018, 5, 1),  date(2018, 9, 1),  "drought_2018"),
-    (date(2019, 6, 1),  date(2019, 8, 1),  "heat_2019_jun_jul"),
-    (date(2020, 8, 1),  date(2020, 9, 1),  "heat_2020_aug"),
-]
-
-
-def expand_months(start: date, end: date) -> List[str]:
-    """Return list of 'YYYY-MM' keys from start (inclusive) to end (exclusive)."""
-    out: List[str] = []
-    y, m = start.year, start.month
-    while (y, m) < (end.year, end.month):
-        out.append(f"{y:04d}-{m:02d}")
-        m += 1
-        if m == 13:
-            m, y = 1, y + 1
-    return out
-
-
-def _all_outlier_keys() -> Tuple[List[str], Dict[str, List[str]]]:
-    """Return (sorted unique excluded keys, per-label key mapping)."""
-    by_label: Dict[str, List[str]] = {
-        label: expand_months(start, end)
-        for start, end, label in OUTLIER_RANGES
-    }
-    excluded = sorted({k for ks in by_label.values() for k in ks})
-    return excluded, by_label
 
 
 # ---------------------------------------------------------------------------
@@ -240,13 +201,6 @@ def build_registry() -> FeatureRegistry:
 # ---------------------------------------------------------------------------
 # Stream → parquet (single pass, bounded memory)
 # ---------------------------------------------------------------------------
-_UNIFORM_DISTRIBUTION = {
-    "year":          ({}, get_dimension_edges("year")),
-    "month_of_year": ({}, get_dimension_edges("month_of_year")),
-    "hour_of_day":   ({}, get_dimension_edges("hour_of_day")),
-}
-
-
 def _registry_fingerprint(reg: FeatureRegistry) -> str:
     """
     Stable identifier for a registry's shape.
@@ -376,14 +330,10 @@ def _ensure_cache(
     else:
         print("[cache] insufficient cached rows for requested run — restreaming")
 
-    excluded_keys, outlier_keys_by_label = _all_outlier_keys()
+    excluded_keys, outlier_keys_by_label = outlier_keys()
 
     # ---- Training stream (uniform distribution, outliers excluded) ----
-    probe = StreamConfig()
-    probe._load_catalog()
-    train_keys = [k for k in probe._partition_keys if k not in set(excluded_keys)]
-    cfg = StreamConfig(partition_keys=train_keys, batch_size=batch_size)
-    cfg.set_distribution(_UNIFORM_DISTRIBUTION)
+    cfg = representative(excluded_keys=excluded_keys, batch_size=batch_size)
     n_train = _stream_to_parquet(cfg, reg, rows, batch_size, train_pq, "train")
 
     # ---- Eval stream: concatenate every outlier split into one parquet ----
@@ -680,7 +630,7 @@ def main() -> int:
     # ---- Build registry + ensure parquet cache ----
     reg = build_registry()
 
-    excluded_keys, outlier_keys_by_label = _all_outlier_keys()
+    excluded_keys, outlier_keys_by_label = outlier_keys()
     print(f"Outlier months excluded from training: {len(excluded_keys)}")
     print(f"Outlier eval splits: {len(outlier_keys_by_label)}")
 

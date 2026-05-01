@@ -29,16 +29,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional
 
 import pandas as pd
 from tqdm.auto import tqdm
 
 from ml import train_all, cyclical
 from stream.classification_groups import UA, WIS_BESTEMMING, WIS_MATERIAAL
-from stream.config import get_dimension_edges
 from stream.features import (
     FeatureRegistry,
     aggregate_in_radius,
@@ -47,6 +45,8 @@ from stream.features import (
 )
 from stream.logging_config import configure_logging
 from stream.stream import StreamConfig
+from stream_configs.outliers import outlier_keys
+from stream_configs.presets import representative
 
 configure_logging(level="DEBUG")
 
@@ -56,35 +56,6 @@ _REPORTS  = _SRC / "reports"
 _CACHE    = _SRC / "stream_cache" / "full_test"
 _REPORTS.mkdir(exist_ok=True)
 _CACHE.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# Outlier date ranges (inclusive, end-exclusive at month level)
-# ============================================================
-
-OUTLIER_RANGES: List[Tuple[date, date, str]] = [
-    (date(2006, 6, 1),  date(2006, 9, 1),  "heat_2006_summer"),
-    (date(2007, 4, 1),  date(2007, 5, 1),  "warm_2007_apr"),
-    (date(2010, 1, 1),  date(2010, 3, 1),  "cold_2010_winter"),
-    (date(2012, 2, 1),  date(2012, 3, 1),  "cold_2012_feb"),
-    (date(2013, 7, 1),  date(2013, 9, 1),  "heat_2013_summer"),
-    (date(2015, 7, 1),  date(2015, 9, 1),  "heat_2015_summer"),
-    (date(2018, 5, 1),  date(2018, 9, 1),  "drought_2018"),
-    (date(2019, 6, 1),  date(2019, 8, 1),  "heat_2019_jun_jul"),
-    (date(2020, 8, 1),  date(2020, 9, 1),  "heat_2020_aug"),
-]
-
-
-def expand_months(start: date, end: date) -> List[str]:
-    """Return list of 'YYYY-MM' keys from start (inclusive) to end (exclusive)."""
-    out: List[str] = []
-    y, m = start.year, start.month
-    while (y, m) < (end.year, end.month):
-        out.append(f"{y:04d}-{m:02d}")
-        m += 1
-        if m == 13:
-            m, y = 1, y + 1
-    return out
 
 
 # ============================================================
@@ -127,35 +98,6 @@ def build_registry() -> FeatureRegistry:
                                      attr_val=val, radius_m=r))
 
     return reg
-
-
-# ============================================================
-# Stream configs
-# ============================================================
-
-UNIFORM_DISTRIBUTION: Dict = {
-    "year":          ({}, get_dimension_edges("year")),
-    "month_of_year": ({}, get_dimension_edges("month_of_year")),
-    "hour_of_day":   ({}, get_dimension_edges("hour_of_day")),
-}
-
-
-def all_partitions() -> List[str]:
-    probe = StreamConfig()
-    probe._load_catalog()
-    return list(probe._partition_keys)
-
-
-def training_config(exclude_keys: List[str], batch_size: int) -> StreamConfig:
-    exclude = set(exclude_keys)
-    train_keys = [k for k in all_partitions() if k not in exclude]
-    cfg = StreamConfig(partition_keys=train_keys, batch_size=batch_size)
-    cfg.set_distribution(UNIFORM_DISTRIBUTION)
-    return cfg
-
-
-def outlier_config(keys: List[str], batch_size: int) -> StreamConfig:
-    return StreamConfig(partition_keys=keys, batch_size=batch_size)
 
 
 # ============================================================
@@ -220,7 +162,7 @@ def _ensure_outlier_caches(
         if path.exists() and not rebuild:
             out[label] = path
             continue
-        cfg = outlier_config(keys, batch_size)
+        cfg = StreamConfig(partition_keys=keys, batch_size=batch_size)
         n = _stream_to_parquet(cfg, reg, max_rows, batch_size, path, label)
         if n > 0:
             out[label] = path
@@ -250,13 +192,7 @@ def main() -> None:
 
     reg = build_registry()
 
-    outlier_keys_by_label: Dict[str, List[str]] = {
-        label: expand_months(start, end)
-        for start, end, label in OUTLIER_RANGES
-    }
-    excluded_keys: List[str] = sorted({
-        k for ks in outlier_keys_by_label.values() for k in ks
-    })
+    excluded_keys, outlier_keys_by_label = outlier_keys()
 
     print("=" * 70)
     print(f"Training partitions exclude {len(excluded_keys)} outlier months")
@@ -284,7 +220,7 @@ def main() -> None:
     # ---- Train every model on the streaming source directly ----
     # train_all() handles streaming end-to-end: scaler fits across the stream,
     # streaming models use partial_fit, RF/HGB use reservoir sampling.
-    train_cfg = training_config(excluded_keys, batch_size)
+    train_cfg = representative(excluded_keys=excluded_keys, batch_size=batch_size)
     results = train_all(
         source     = train_cfg,
         registry   = reg,

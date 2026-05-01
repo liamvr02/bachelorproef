@@ -1275,24 +1275,6 @@ class StreamConfig:
                           partition_key, part_idx + 1, len(partitions), weight,
                           part_limit if part_limit is not None else "∞")
 
-                # Estimate batch count BEFORE opening the streaming cursor.
-                # Any query on lst_conn while the cursor is open would replace
-                # the active DuckDB result set, making fetchmany return [].
-                est_batches = None
-                if part_limit is not None:
-                    est_batches = max(1, (part_limit + bs - 1) // bs)
-                else:
-                    try:
-                        n_part = lst_conn.execute(
-                            "SELECT COUNT(*) FROM lst WHERE partition_key = ?",
-                            [partition_key]
-                        ).fetchone()[0]
-                        est_batches = max(1, (n_part + bs - 1) // bs)
-                        log.debug("partition %s: ~%d rows, ~%d batches",
-                                  partition_key, n_part, est_batches)
-                    except Exception:
-                        pass
-
                 # Build the cursor SQL — add LIMIT when a cap is set so DuckDB
                 # reads only the required rows from disk.
                 limit_sql = f" LIMIT {part_limit}" if part_limit is not None else ""
@@ -1308,15 +1290,6 @@ class StreamConfig:
 
                 batch_num = 0
                 first_batch_feat_time: Optional[float] = None
-
-                batch_bar = tqdm(
-                    total=est_batches,
-                    desc=f"  {partition_key}",
-                    unit="batch",
-                    position=1,
-                    leave=False,
-                    dynamic_ncols=True,
-                )
 
                 try:
                     while True:
@@ -1403,18 +1376,13 @@ class StreamConfig:
                         elapsed    = time.perf_counter() - session_t0
                         throughput = session_rows / elapsed if elapsed > 0 else 0
 
-                        batch_bar.update(1)
-                        batch_bar.set_postfix({
-                            "rows":   f"{part_rows:,}",
-                            "r/s":    f"{throughput:,.0f}",
-                            "feat_s": f"{first_batch_feat_time:.1f}s"
-                                      if first_batch_feat_time else "...",
-                        }, refresh=False)
                         part_bar.set_postfix({
                             "pk":      partition_key,
                             "weight":  f"{weight:.3f}",
                             "yielded": f"{session_rows:,}",
                             "r/s":     f"{throughput:,.0f}",
+                            "feat_s":  f"{first_batch_feat_time:.1f}s"
+                                       if first_batch_feat_time else "...",
                         }, refresh=False)
 
                         # In sequential mode (no quotas), stop as soon as the
@@ -1424,9 +1392,6 @@ class StreamConfig:
                         if max_rows is not None and session_rows >= max_rows:
                             stop_early = True
                             break
-
-                finally:
-                    batch_bar.close()
 
                 part_elapsed = time.perf_counter() - part_t0
                 part_rps     = part_rows / part_elapsed if part_elapsed > 0 else 0
