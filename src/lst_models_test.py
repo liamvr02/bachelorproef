@@ -24,46 +24,13 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from ml import train_all, cyclical
-from stream.classification_groups import UA, WIS_BESTEMMING
-from stream.features import (
-    FeatureRegistry,
-    aggregate_in_radius,
-    urban_atlas_classifications_fractions,
-    wis_fraction,
-)
 from stream.logging_config import configure_logging
 from stream_configs.presets import all_rows
+from stream_configs.registry import build_registry
 
 _SRC      = Path(__file__).parent
 _REPORTS  = _SRC / "reports"
 _REPORTS.mkdir(exist_ok=True)
-
-
-def build_registry() -> FeatureRegistry:
-    """Compact registry — same shape as lst_sanity_test for fast smoke runs."""
-    reg = FeatureRegistry()
-
-    for r in (50, 100):
-        for agg in ("avg", "max"):
-            reg.add(aggregate_in_radius(
-                "dhm", radius_m=r, columns=["elevation"],
-                agg=agg, temporal="last_previous",
-            ))
-
-    for r in (50, 100):
-        reg.add(aggregate_in_radius(
-            "trees", radius_m=r, columns=[], agg="count", temporal="none",
-        ))
-
-    reg.add(urban_atlas_classifications_fractions(
-        classification_map=UA, radius_m=100,
-    ))
-
-    for leaves in WIS_BESTEMMING.values():
-        for val in leaves:
-            reg.add(wis_fraction(attr_col="bestemming", attr_val=val, radius_m=50))
-
-    return reg
 
 
 def _df_chunks(df: pd.DataFrame, batch_size: int) -> Generator[pd.DataFrame, None, None]:

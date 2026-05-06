@@ -775,7 +775,7 @@ class StreamConfig:
                         raster._layers[layer_key]   = arr
                         raster._coverage[layer_key] = n_nonzero
                         n_cache_hits += 1
-                        log.info("raster %s cache HIT  %s  (%d non-zero, %.2fs)",
+                        log.debug("raster %s cache HIT  %s  (%d non-zero, %.2fs)",
                                  tag, cache_layer_key, n_nonzero, t_cache_lookup)
                         layer_bar.set_postfix(
                             hit=n_cache_hits, computed=n_computed, refresh=False
@@ -1291,107 +1291,106 @@ class StreamConfig:
                 batch_num = 0
                 first_batch_feat_time: Optional[float] = None
 
-                try:
-                    while True:
-                        # In quota mode the LIMIT on the cursor already caps how
-                        # many rows this partition contributes; we just read until
-                        # the cursor is exhausted.  In sequential mode we still
-                        # need to honour the global max_rows budget.
-                        if partition_quotas is None and max_rows is not None:
-                            remaining = max_rows - session_rows
-                            if remaining <= 0:
-                                stop_early = True
-                                break
-                            fetch_n = min(bs, remaining)
-                        else:
-                            fetch_n = bs
-
-                        t_fetch = time.perf_counter()
-                        raw_rows = cursor.fetchmany(fetch_n)
-                        fetch_ms = (time.perf_counter() - t_fetch) * 1000
-                        log.debug("partition %s batch %d: fetchmany(%d) -> %d rows "
-                                  "in %.0fms",
-                                  partition_key, batch_num, fetch_n,
-                                  len(raw_rows), fetch_ms)
-
-                        if not raw_rows:
-                            break
-
-                        base_df = pd.DataFrame(raw_rows, columns=FeatureRow._fields)
-
-                        # Resolve LST temperature from 3 emissivity sources based on mode
-                        temperature = self._resolve_lst_temperature(base_df)
-                        base_df.insert(2, "temperature", temperature)
-
-                        if not has_batch and not has_row:
-                            yield base_df
-                            n_yielded = len(raw_rows)
-                        else:
-                            out_cols_data: Dict[str, np.ndarray] = {
-                                col: base_df[col].to_numpy()
-                                for col in base_df.columns
-                            }
-
-                            t_feat = time.perf_counter()
-
-                            if has_batch:
-                                batch_feat_df = registry.compute_batch_features(
-                                    base_df, feature_conns
-                                )
-                                for col in batch_feat_df.columns:
-                                    out_cols_data[col] = batch_feat_df[col].to_numpy()
-
-                            if has_row:
-                                row_feat_df = registry.compute_row_features(
-                                    raw_rows, feature_conns
-                                )
-                                for col in row_feat_df.columns:
-                                    out_cols_data[col] = row_feat_df[col].to_numpy()
-
-                            feat_elapsed = time.perf_counter() - t_feat
-                            if first_batch_feat_time is None:
-                                first_batch_feat_time = feat_elapsed
-                                log.debug("partition %s batch %d: first feature batch "
-                                          "in %.2fs - cols: %s",
-                                          partition_key, batch_num, feat_elapsed,
-                                          [c for c in out_cols_data
-                                           if c not in FeatureRow._fields])
-                            
-
-
-                            try:
-                                result_df = pd.DataFrame(out_cols_data)
-                            except:
-                                log.error("partition %s batch %d: error creating result DataFrame",
-                                          partition_key, batch_num, exc_info=True)
-                                log.error(f"out_cols_data={out_cols_data}")
-                                raise
-                            yield result_df
-                            n_yielded = len(result_df)
-
-                        session_rows += n_yielded
-                        part_rows    += n_yielded
-                        batch_num    += 1
-
-                        elapsed    = time.perf_counter() - session_t0
-                        throughput = session_rows / elapsed if elapsed > 0 else 0
-
-                        part_bar.set_postfix({
-                            "pk":      partition_key,
-                            "weight":  f"{weight:.3f}",
-                            "yielded": f"{session_rows:,}",
-                            "r/s":     f"{throughput:,.0f}",
-                            "feat_s":  f"{first_batch_feat_time:.1f}s"
-                                       if first_batch_feat_time else "...",
-                        }, refresh=False)
-
-                        # In sequential mode (no quotas), stop as soon as the
-                        # global max_rows budget is exhausted.
-                        # In quota mode the LIMIT on the cursor handles capping;
-                        # stop_early is only set if somehow session_rows overshoots.
-                        if max_rows is not None and session_rows >= max_rows:
+                while True:
+                    # In quota mode the LIMIT on the cursor already caps how
+                    # many rows this partition contributes; we just read until
+                    # the cursor is exhausted.  In sequential mode we still
+                    # need to honour the global max_rows budget.
+                    if partition_quotas is None and max_rows is not None:
+                        remaining = max_rows - session_rows
+                        if remaining <= 0:
                             stop_early = True
                             break
+                        fetch_n = min(bs, remaining)
+                    else:
+                        fetch_n = bs
+
+                    t_fetch = time.perf_counter()
+                    raw_rows = cursor.fetchmany(fetch_n)
+                    fetch_ms = (time.perf_counter() - t_fetch) * 1000
+                    log.debug("partition %s batch %d: fetchmany(%d) -> %d rows "
+                                "in %.0fms",
+                                partition_key, batch_num, fetch_n,
+                                len(raw_rows), fetch_ms)
+
+                    if not raw_rows:
+                        break
+
+                    base_df = pd.DataFrame(raw_rows, columns=FeatureRow._fields)
+
+                    # Resolve LST temperature from 3 emissivity sources based on mode
+                    temperature = self._resolve_lst_temperature(base_df)
+                    base_df.insert(2, "temperature", temperature)
+
+                    if not has_batch and not has_row:
+                        yield base_df
+                        n_yielded = len(raw_rows)
+                    else:
+                        out_cols_data: Dict[str, np.ndarray] = {
+                            col: base_df[col].to_numpy()
+                            for col in base_df.columns
+                        }
+
+                        t_feat = time.perf_counter()
+
+                        if has_batch:
+                            batch_feat_df = registry.compute_batch_features(
+                                base_df, feature_conns
+                            )
+                            for col in batch_feat_df.columns:
+                                out_cols_data[col] = batch_feat_df[col].to_numpy()
+
+                        if has_row:
+                            row_feat_df = registry.compute_row_features(
+                                raw_rows, feature_conns
+                            )
+                            for col in row_feat_df.columns:
+                                out_cols_data[col] = row_feat_df[col].to_numpy()
+
+                        feat_elapsed = time.perf_counter() - t_feat
+                        if first_batch_feat_time is None:
+                            first_batch_feat_time = feat_elapsed
+                            log.debug("partition %s batch %d: first feature batch "
+                                        "in %.2fs - cols: %s",
+                                        partition_key, batch_num, feat_elapsed,
+                                        [c for c in out_cols_data
+                                        if c not in FeatureRow._fields])
+                        
+
+
+                        try:
+                            result_df = pd.DataFrame(out_cols_data)
+                        except:
+                            log.error("partition %s batch %d: error creating result DataFrame",
+                                        partition_key, batch_num, exc_info=True)
+                            log.error(f"out_cols_data={out_cols_data}")
+                            raise
+                        yield result_df
+                        n_yielded = len(result_df)
+
+                    session_rows += n_yielded
+                    part_rows    += n_yielded
+                    batch_num    += 1
+
+                    elapsed    = time.perf_counter() - session_t0
+                    throughput = session_rows / elapsed if elapsed > 0 else 0
+
+                    part_bar.set_postfix({
+                        "pk":      partition_key,
+                        "weight":  f"{weight:.3f}",
+                        "yielded": f"{session_rows:,}",
+                        "r/s":     f"{throughput:,.0f}",
+                        "feat_s":  f"{first_batch_feat_time:.1f}s"
+                                    if first_batch_feat_time else "...",
+                    }, refresh=False)
+
+                    # In sequential mode (no quotas), stop as soon as the
+                    # global max_rows budget is exhausted.
+                    # In quota mode the LIMIT on the cursor handles capping;
+                    # stop_early is only set if somehow session_rows overshoots.
+                    if max_rows is not None and session_rows >= max_rows:
+                        stop_early = True
+                        break
 
                 part_elapsed = time.perf_counter() - part_t0
                 part_rps     = part_rows / part_elapsed if part_elapsed > 0 else 0

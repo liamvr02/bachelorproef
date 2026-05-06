@@ -37,15 +37,9 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from ml import StreamingScaler, sanity, train_all, cyclical
-from stream.classification_groups import UA, WIS_BESTEMMING
-from stream.features import (
-    FeatureRegistry,
-    aggregate_in_radius,
-    urban_atlas_classifications_fractions,
-    wis_fraction,
-)
 from stream.logging_config import configure_logging
 from stream_configs.presets import all_rows
+from stream_configs.registry import build_registry
 
 
 _FAST_MODELS = ["huber", "linear", "ridge", "elastic_net", "sgd", "nystroem_sgd"]
@@ -69,39 +63,6 @@ class _SanityCapture(logging.Handler):
         for r in self.records:
             out[r.levelname].append(r.getMessage())
         return out
-
-
-# ---------------------------------------------------------------------------
-# Tiny but representative registry
-# ---------------------------------------------------------------------------
-def build_registry() -> FeatureRegistry:
-    reg = FeatureRegistry()
-
-    # DHM aggregates — covers numeric scalar features.
-    for r in (50, 100):
-        for agg in ("avg", "max"):
-            reg.add(aggregate_in_radius(
-                "dhm", radius_m=r, columns=["elevation"],
-                agg=agg, temporal="last_previous",
-            ))
-
-    # Tree count — covers integer counts.
-    for r in (50, 100):
-        reg.add(aggregate_in_radius(
-            "trees", radius_m=r, columns=[], agg="count", temporal="none",
-        ))
-
-    # UA classifications — temporal fraction features.
-    reg.add(urban_atlas_classifications_fractions(
-        classification_map=UA, radius_m=100,
-    ))
-
-    # WIS bestemming — static fraction features (one radius is enough).
-    for leaves in WIS_BESTEMMING.values():
-        for val in leaves:
-            reg.add(wis_fraction(attr_col="bestemming", attr_val=val, radius_m=50))
-
-    return reg
 
 
 # ---------------------------------------------------------------------------

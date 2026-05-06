@@ -42,6 +42,7 @@ from config import APPEND_BATCH_ROWS, LST_COLUMNS
 from db import open_duckdb
 from spatial import (
     add_h3,
+    add_tile_columns,
     get_ghent_convex_hull_polygon,
     get_ghent_exact_polygon,
     iter_raster_blocks_masked,
@@ -118,7 +119,7 @@ def _parse_lst_folder(name: str) -> Optional[dict]:
 # Ingestor
 # ============================================================
 
-def ingest_lst(downloads: Path, output: Path) -> int:
+def ingest_lst(downloads: Path, output: Path, ngi_gdf=None) -> int:
     """
     Convert all LST and NDVI TIF folders into a single unified DuckDB table.
 
@@ -164,6 +165,11 @@ def ingest_lst(downloads: Path, output: Path) -> int:
             timestamp        VARCHAR,
             partition_key    VARCHAR,
             tile_id          VARCHAR,
+            tile_h3_r8       VARCHAR,
+            tile_h3_r7       VARCHAR,
+            tile_rect_1km    VARCHAR,
+            tile_rect_2km    VARCHAR,
+            tile_ngi         VARCHAR,
             year             INTEGER,
             month_of_year    INTEGER,
             day_of_month     INTEGER,
@@ -293,6 +299,9 @@ def ingest_lst(downloads: Path, output: Path) -> int:
             if col not in merged_df.columns:
                 merged_df[col] = None
             merged_df[col] = merged_df[col].astype("float64", errors="ignore")
+
+        # ---- Alternative tile columns ----------------------------------
+        merged_df = add_tile_columns(merged_df, ngi_gdf=ngi_gdf)
 
         # ---- Attach spatiotemporal metadata ----------------------------
         meta = folder_meta[active_folders[0].name]

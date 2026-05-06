@@ -5,6 +5,11 @@ src/downloads/lst_tifs/*
 
 src/downloads/DHM[1,2]_extracted/*
 
+*.html
+*.parquet
+ds_test_*.json
+src/test_data/*
+
 # MLflow runs
 **/mlruns
 

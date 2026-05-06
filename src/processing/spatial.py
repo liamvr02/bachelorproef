@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import h3
 import numpy as np
@@ -25,7 +25,7 @@ from shapely.ops import transform as shapely_transform
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gathering"))
 from ghent_polygon import get_ghent_outers, get_ghent_convex_hull
 
-from config import H3_RES, BLOCK_LIMIT
+from config import H3_RES, BLOCK_LIMIT, _wgs84_to_lambert
 
 log = logging.getLogger("spatial")
 
@@ -247,6 +247,77 @@ def add_h3(df: pd.DataFrame, resolution: int = H3_RES) -> pd.DataFrame:
         h3.latlng_to_cell(float(lat), float(lon), resolution)
         for lat, lon in zip(lats, lons)
     ]
+    return df
+
+
+# ============================================================
+# Alternative tile columns (H3 coarser, rectangular, NGI)
+# ============================================================
+
+def add_tile_columns(
+    df: pd.DataFrame,
+    h3_extra_resolutions: tuple = (7, 8),
+    rect_sizes_m: tuple = (1000.0, 2000.0),
+    ngi_gdf: Optional[Any] = None,
+    ngi_id_col: str = "CODE",
+) -> pd.DataFrame:
+    """
+    Add alternative spatial tiling columns to df (must have longitude/latitude).
+
+    Columns added:
+        tile_h3_r{res}   -- H3 cell at coarser resolution (default r8 ~860m, r7 ~2.3km)
+        tile_rect_{n}km  -- rectangular grid cell in Belgian Lambert 1972 (EPSG:31370)
+        tile_ngi         -- NGI kaartbladversnijding ID (None when ngi_gdf not provided)
+    """
+    lats = df["latitude"].to_numpy()
+    lons = df["longitude"].to_numpy()
+
+    for res in h3_extra_resolutions:
+        df[f"tile_h3_r{res}"] = [
+            h3.latlng_to_cell(float(lat), float(lon), res)
+            for lat, lon in zip(lats, lons)
+        ]
+
+    if rect_sizes_m:
+        lx, ly = _wgs84_to_lambert.transform(lons, lats)
+        for size_m in rect_sizes_m:
+            size_m_f = float(size_m)
+            label = (
+                f"{int(size_m_f / 1000)}km"
+                if size_m_f % 1000.0 == 0.0
+                else f"{int(size_m_f)}m"
+            )
+            ix = np.floor(lx / size_m_f).astype(int)
+            iy = np.floor(ly / size_m_f).astype(int)
+            df[f"tile_rect_{label}"] = [f"{x}_{y}" for x, y in zip(ix, iy)]
+
+    if ngi_gdf is not None:
+        import geopandas as gpd  # optional dependency
+
+        gdf_pts = gpd.GeoDataFrame(
+            df[["longitude", "latitude"]].copy(),
+            geometry=gpd.points_from_xy(lons, lats),
+            crs="EPSG:4326",
+        )
+        ngi_wgs = (
+            ngi_gdf.to_crs("EPSG:4326")
+            if str(ngi_gdf.crs) != "EPSG:4326"
+            else ngi_gdf
+        )
+        joined = gpd.sjoin(
+            gdf_pts,
+            ngi_wgs[[ngi_id_col, "geometry"]],
+            how="left",
+            predicate="within",
+        )
+        # sjoin may duplicate rows when a point touches multiple polygon edges; keep first.
+        joined = joined[~joined.index.duplicated(keep="first")]
+        df["tile_ngi"] = (
+            joined[ngi_id_col].astype(object).where(joined[ngi_id_col].notna(), other=None).values
+        )
+    else:
+        df["tile_ngi"] = None
+
     return df
 
 

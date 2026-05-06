@@ -41,7 +41,6 @@ import time
 from collections import namedtuple
 from typing import Callable, Dict, List, Optional, Tuple
 
-from narwhals import col
 import numpy as np
 import pandas as pd
 
@@ -400,18 +399,40 @@ def aggregate_in_radius(
 
 
 def trees_count_planted_by(
+    dataset_id: str = "trees",
+    *,
     radius_m: float,
+    columns: Optional[List[str]] = None,
+    agg: str = "count",
+    temporal: str = "none",
     prefix: str = "",
+    attr_filter: Optional[Dict[str, str]] = None,
 ) -> _FeatureDescriptor:
     """
     Factory: count of trees within *radius_m* whose ``aanlegjaar`` is known
     and <= year(scene_ts).  This is the staggered-DiD treatment dose.
 
+    Compatible with ``aggregate_in_radius`` — accepts the same optional args
+    (``columns``, ``agg``, ``temporal``, ``attr_filter``) and forwards them.
+    ``aanlegjaar_lte_scene`` is always True (that is the point of this factory).
+
     Output column
     -------------
-    ``trees_plantedby_{radius_m}m_count`` (default prefix
-    ``trees_plantedby_{radius_m}m_``).  The radius is baked into the prefix
-    so multiple radii can be registered side-by-side without column collision.
+    ``trees_plantedby_{radius_m}m_count`` (default prefix, no attr_filter).
+    When *attr_filter* is supplied, the filter suffix is appended to the
+    prefix so multiple filtered descriptors can coexist at the same radius:
+    ``trees_plantedby_{radius_m}m_{k}={v}_count``.
+
+    Parameters
+    ----------
+    dataset_id : dataset to query (default "trees").
+    radius_m   : search radius in metres (keyword-only).
+    columns    : columns to aggregate; ignored when agg="count".
+    agg        : aggregation — "count" (default), "avg", "sum", "min", "max".
+    temporal   : temporal join mode (default "none").
+    prefix     : override the auto-generated column prefix.
+    attr_filter: equality predicates forwarded to the query, e.g.
+                 ``{"beheerfase": "Jeugdfase"}``.
 
     Notes
     -----
@@ -421,14 +442,23 @@ def trees_count_planted_by(
     is observed.  The complementary count (trees with NULL ``aanlegjaar``)
     can be obtained via ``aggregate_in_radius("trees", agg="count")``.
     """
-    _prefix = prefix or f"trees_plantedby_{int(radius_m)}m_"
+    if not prefix:
+        if attr_filter:
+            suffix = "_" + "_".join(
+                f"{k}={str(v).replace(' ', '_')}" for k, v in attr_filter.items()
+            )
+        else:
+            suffix = ""
+        prefix = f"trees_plantedby_{int(radius_m)}m{suffix}_"
+
     return aggregate_in_radius(
-        dataset_id="trees",
+        dataset_id=dataset_id,
         radius_m=radius_m,
-        columns=[],
-        agg="count",
-        temporal="none",
-        prefix=_prefix,
+        columns=list(columns) if columns is not None else [],
+        agg=agg,
+        temporal=temporal,
+        prefix=prefix,
+        attr_filter=attr_filter,
         aanlegjaar_lte_scene=True,
     )
 

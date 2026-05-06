@@ -34,7 +34,7 @@ SQL extraction expression in catalog.py's _write_lst_histograms().
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from pyproj import Transformer
@@ -169,6 +169,7 @@ CRS_WGS84   = "EPSG:4326"
 CRS_LAEA    = "EPSG:3035"
 
 _lambert_to_wgs84 = Transformer.from_crs(CRS_LAMBERT, CRS_WGS84, always_xy=True)
+_wgs84_to_lambert = Transformer.from_crs(CRS_WGS84, CRS_LAMBERT, always_xy=True)
 
 # LST_COLUMNS — ordered column list for conn.append().
 # The five time-component columns are stored alongside timestamp so that
@@ -177,8 +178,13 @@ LST_COLUMNS = [
     "longitude", "latitude",
     "aster_lst", "modis_lst", "ndvi",
     "image_id", "timestamp", "partition_key", "tile_id",
+    "tile_h3_r8", "tile_h3_r7", "tile_rect_1km", "tile_rect_2km", "tile_ngi",
     "year", "month_of_year", "day_of_month", "day_of_year", "hour_of_day",
 ]
+
+# Path to the NGI kaartbladversnijdingen shapefile (optional).
+# Set to a Path when running ingest_lst to enable tile_ngi computation.
+NGI_SHAPEFILE_PATH: Optional[Path] = DEFAULT_DOWNLOADS / "NGI" / "Kaartbladversnijdingen_NGI_numerieke_reeks_Shapefile" / "Shapefile"
 
 APPEND_BATCH_ROWS = 1_000_000
 

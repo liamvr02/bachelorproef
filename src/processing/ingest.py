@@ -48,7 +48,7 @@ import sqlite3
 from pathlib import Path
 
 from catalog import write_catalog
-from config import DATASET_REGISTRY, DEFAULT_DOWNLOADS, DEFAULT_OUTPUT
+from config import DATASET_REGISTRY, DEFAULT_DOWNLOADS, DEFAULT_OUTPUT, NGI_SHAPEFILE_PATH
 from db import open_duckdb
 from ingest_dhm import ingest_dhm
 from ingest_lst import ingest_lst
@@ -132,7 +132,16 @@ def _run_ingestion(
     if any(d in only for d in ("lst", "ndvi")):
         if not _skip("lst"):
             _banner("LST (with ASTER/MODIS/NDVI)  ->  lst.duckdb")
-            n = ingest_lst(downloads, output)
+            ngi_gdf = None
+            if NGI_SHAPEFILE_PATH is not None:
+                _ngi_shp = NGI_SHAPEFILE_PATH / "Kbl.shp"
+                if _ngi_shp.exists():
+                    import geopandas as gpd
+                    log.info("Loading NGI shapefile: %s", _ngi_shp)
+                    ngi_gdf = gpd.read_file(_ngi_shp)
+                else:
+                    log.warning("NGI shapefile not found at %s — tile_ngi will be NULL", _ngi_shp)
+            n = ingest_lst(downloads, output, ngi_gdf=ngi_gdf)
             log.info("LST total rows: %d", n)
         if "lst"  in only: processed.append("lst")
         if "ndvi" in only: processed.append("ndvi")

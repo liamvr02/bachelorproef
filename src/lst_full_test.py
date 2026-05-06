@@ -36,17 +36,11 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from ml import train_all, cyclical
-from stream.classification_groups import UA, WIS_BESTEMMING, WIS_MATERIAAL
-from stream.features import (
-    FeatureRegistry,
-    aggregate_in_radius,
-    urban_atlas_classifications_fractions,
-    wis_fraction,
-)
 from stream.logging_config import configure_logging
 from stream.stream import StreamConfig
 from stream_configs.outliers import outlier_keys
 from stream_configs.presets import representative
+from stream_configs.registry import build_registry
 
 configure_logging(level="DEBUG")
 
@@ -56,48 +50,6 @@ _REPORTS  = _SRC / "reports"
 _CACHE    = _SRC / "stream_cache" / "full_test"
 _REPORTS.mkdir(exist_ok=True)
 _CACHE.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# Feature registry
-# ============================================================
-
-def build_registry() -> FeatureRegistry:
-    reg = FeatureRegistry()
-
-    dhm_radii = (50, 70, 100)
-    dhm_aggs = ("avg", "sum", "min", "max")
-    for r in dhm_radii:
-        for agg in dhm_aggs:
-            reg.add(aggregate_in_radius(
-                "dhm",
-                radius_m=r,
-                columns=["elevation"],
-                agg=agg,
-                temporal="last_previous",
-            ))
-
-    for r in (50, 70, 100):
-        reg.add(aggregate_in_radius(
-            "trees", radius_m=r, columns=[], agg="count", temporal="none",
-        ))
-
-    for r in (50, 100):
-        reg.add(urban_atlas_classifications_fractions(
-            classification_map=UA, radius_m=r,
-        ))
-
-    for r in (50, 100):
-        for leaves in WIS_BESTEMMING.values():
-            for val in leaves:
-                reg.add(wis_fraction(attr_col="bestemming",
-                                     attr_val=val, radius_m=r))
-        for leaves in WIS_MATERIAAL.values():
-            for val in leaves:
-                reg.add(wis_fraction(attr_col="materiaalsoort",
-                                     attr_val=val, radius_m=r))
-
-    return reg
 
 
 # ============================================================
