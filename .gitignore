@@ -9,6 +9,7 @@ src/downloads/DHM[1,2]_extracted/*
 *.parquet
 ds_test_*.json
 src/test_data/*
+ds_reports/
 
 # MLflow runs
 **/mlruns

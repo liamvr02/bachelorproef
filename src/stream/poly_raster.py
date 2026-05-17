@@ -888,28 +888,30 @@ class _PolyRaster:
         return None if math.isnan(v) else v
 
     def lookup_ua_last_previous(
-        self, lon: float, lat: float, luc_code: str, lst_year: int
+        self, lon: float, lat: float, luc_code: str, lst_year: int,
+        radius_m: float,
     ) -> Optional[float]:
         """
         Return the UA fraction for the last_previous survey year <= lst_year.
-        Layer keys are formatted as "{luc_code}:{ua_year}".
+        Layer keys are formatted as "{luc_code}:{ua_year}:r{radius_m}m".
         Returns None if no layer is available for any year <= lst_year.
         """
+        r_tag = f":r{int(radius_m)}m"
         best_year = None
         for y in self.UA_YEARS:
             if y <= lst_year:
-                key = f"{luc_code}:{y}"
+                key = f"{luc_code}:{y}{r_tag}"
                 if self.has_layer(key):
                     best_year = y
         if best_year is None:
             return None
-        return self.lookup(lon, lat, f"{luc_code}:{best_year}")
+        return self.lookup(lon, lat, f"{luc_code}:{best_year}{r_tag}")
 
     def lookup_wis(
-        self, lon: float, lat: float, attr_val: str
+        self, lon: float, lat: float, attr_val: str, radius_m: float,
     ) -> Optional[float]:
-        """Return the WIS fraction for a given attribute value (static)."""
-        return self.lookup(lon, lat, f"wis:{attr_val}")
+        """Return the WIS fraction for a given attribute value and radius."""
+        return self.lookup(lon, lat, f"wis:{attr_val}:r{int(radius_m)}m")
 
     # ------------------------------------------------------------------
     # Summary

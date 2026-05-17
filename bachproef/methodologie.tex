@@ -26,5 +26,196 @@
 %% Maak voor elke fase (behalve het literatuuronderzoek) een NIEUW HOOFDSTUK aan
 %% en geef het een gepaste titel.
 
-\lipsum[21-25]
+Dit hoofdstuk beschrijft de methodologie die gebruikt wordt om het effect van stedelijke vergroening op de oppervlaktetemperatuur in Gent te onderzoeken.
+De aanpak is opgebouwd rond vier opeenvolgende fasen: dataverzameling, data-ingestie en voorbereiding, feature engineering via een streamingspijplijn, en ten slotte statistische analyse en modellering.
+Sectie~\ref{sec:uitdagingen} documenteert aanvullend de technische hindernissen die de architectuur hebben gevormd; lezers die enkel de methodologie willen reproduceren kunnen dat onderdeel overslaan.
+
+Ten opzichte van het oorspronkelijke onderzoeksvoorstel zijn twee belangrijke aanpassingen doorgevoerd.
+Het ruimtelijk-temporele fusiestap (ESTARFM) valt weg omdat de beschikbare LST-data voldoende tijdspunten bevat voor een robuuste analyse zonder extra fusie.
+Daarnaast is het digitaal hoogtemodel (DHM) toegevoegd als bijkomende covariabele, omdat hoogteverschillen in Gent een meetbare invloed hebben op lokale oppervlaktetemperaturen.
+
+%---------- Fase 1: Databronnen -----------------------------------------------
+\section{Databronnen}
+\label{sec:databronnen}
+
+De studie combineert vijf databronnen die elk een andere dimensie van de stedelijke omgeving beschrijven.
+
+\paragraph{Land Surface Temperature (LST)}
+LST-waarden worden afgeleid van Landsat-beelden via de methode van \textcite{Parastatidis2017}, die drie emissiviteitsmodellen levert per acquisitieblok: ASTER-, MODIS- en NDVI-gebaseerde schattingen.
+De ruimtelijke resolutie bedraagt 30~m per pixel.
+Elke acquisitie bestrijkt één moment in de tijd; de dataset bevat beelden van 2000 tot en met 2024, verdeeld over 247 maandpartities.
+
+\paragraph{Digitaal Hoogtemodel (DHM)}
+Het Vlaams DHM is beschikbaar in twee versies: DHM1 (opnamejaar circa 2001--2004) en DHM2 (circa 2013--2015), beiden met een resolutie van 5~m.
+Hoogtedata wordt als covariabele opgenomen omdat dalingtopografie en heuvelrug de lokale thermische omstandigheden beïnvloeden onafhankelijk van vergroening.
+
+\paragraph{Bomeninventaris Gent}
+De bomeninventaris van de Stad Gent \autocite{StadGentBomen} bevat puntlocaties van individuele bomen met attributen als hoogte, stamomtrek, beheerfase en, voor een subset van bomen (~27\%), het aanlegjaar.
+Dit aanlegjaar is cruciaal voor de causale analyse: het laat toe om voor elke LST-opname te bepalen welke bomen op dat moment reeds aangeplant waren.
+
+\paragraph{Urban Atlas}
+Urban Atlas \autocite{EEA2020} levert landgebruikspolygonen voor vier survey-jaren: 2006, 2012, 2018 en 2021.
+De veelheid aan landgebruiksklassen wordt herleid tot zeven semantische categorieën op basis van thermisch gelijkaardig gedrag: hoog verhard stedelijk weefsel, laag verhard stedelijk weefsel, transportinfrastructuur, stedelijk groen, natuurlijk groen, water en wetlands, en kaal of in ontwikkeling.
+
+\paragraph{Wegeninformatiesysteem Gent (WIS)}
+Het WIS bevat gedetailleerde wegoppervlaktepolygonen met twee categorische attributen: bestemming (gemotoriseerd verkeer, langzaam verkeer, groen, overige) en materiaalsoort (volledig verhard, semi-permeabel, onverhard).
+Deze dataset biedt fijnmazige informatie over verharding die Urban Atlas niet op dit detailniveau levert.
+
+%---------- Fase 2: Data-ingestie en voorbereiding ----------------------------
+\section{Data-ingestie en voorbereiding}
+\label{sec:ingestie}
+
+Alle databronnen worden via een geautomatiseerde ingestiepijplijn omgezet naar een gestandaardiseerde feature store die klaarstaat voor de streamingsfase.
+
+\subsection{Verwerking van LST-rasterdata}
+
+De LST GeoTIFFs worden per acquisitie ingelezen met behulp van \texttt{rasterio}.
+Om geheugengebruik te beheersen worden rasterblokken één voor één verwerkt; de pixels worden daarna gemaskeerd tot de exacte Gentse gemeentegrens via een GDAL-niveau polygoonkniping.
+NDVI-beelden worden geknipt op de convexe romp van de gemeente om randartefacten te vermijden.
+
+Per acquisitie bestaan er drie emissiviteitsproducten (ASTER, MODIS, NDVI) die elk op een afzonderlijk tijdstip en met een afwijkende spatiale dekking kunnen beschikbaar zijn.
+Deze drie producten worden via een buitenste verbinding (\textit{outer join}) op pixelcoördinaat samengevoegd tot één rij per locatie, zodat geen enkel datapunt verloren gaat.
+Op het moment van analyse kan de gebruiker kiezen welke emissiviteitskolom of fallback-volgorde wordt gebruikt.
+
+\subsection{Ruimtelijke indexering}
+
+Elke LST-pixel krijgt meerdere ruimtelijke sleutels toegewezen.
+Als primaire tileindex wordt het H3-hexagonaal raster op resolutie~9 gebruikt (~174~m celdiameter, ~0,17~km² per cel).
+Pixels die dezelfde H3-cel delen, bevinden zich altijd binnen ~200~m van elkaar; dit gegeven wordt in de streamingsfase benut om ruimtelijke query's te dedupliceren.
+Aanvullend worden rechthoekige rastercellen berekend in het Belgisch Lambert 1972-stelsel (EPSG:31370) op 1~km en 2~km schaal, en worden pixels optioneel gekoppeld aan NGI-kaartbladversnijdingen.
+
+\subsection{Tijdcomponenten}
+
+Om herhaalde tekstparsing te vermijden worden vijf tijdcomponenten eenmalig bij ingestie berekend en opgeslagen: kalenderjaar, maand van het jaar, dag van de maand, dag van het jaar en fractioneel UTC-uur.
+Deze componenten fungeren elk als een zelfstandige, beheersbare dimensie in de latere samplingsstap.
+
+\subsection{Opslag}
+
+Puntdata (LST, DHM, bomen) worden opgeslagen in DuckDB, een ingebedde kolombewaarplaats met analytische optimalisaties.
+De LST-tabel wordt fysiek gesorteerd op \texttt{(partition\_key, tile\_id)} zodat DuckDB via zonemapindex de meeste rijgroepen overslaat bij per-maand-partitiequery's.
+Polygoondata (Urban Atlas, WIS) worden opgeslagen in SpatiaLite, dat een ingebouwde R-boomindex levert voor efficiënte begrenzingsbox-voorfiltering.
+
+Een catalogusdatabase slaat voor elke maandpartitie histogrammen op over alle relevante dimensies, inclusief temperatuur, tijdcomponenten en geografische coördinaten.
+Deze histogrammen worden in de volgende fase gebruikt om partities te wegen zonder de volledige LST-tabel te hoeven scannen.
+
+%---------- Fase 3: Feature engineering via streamingspijplijn ----------------
+\section{Feature engineering via streamingspijplijn}
+\label{sec:streaming}
+
+De LST-tabel telt circa 725 miljoen rijen en past niet in werkgeheugen.
+Analyse gebeurt daarom via een streamingsgenerator die de data maandpartitie per maandpartitie verwerkt en per batch een \texttt{DataFrame} oplevert.
+
+\subsection{Gewogen partitieselectie}
+
+Alvorens te streamen worden de maandpartities gewogen op basis van hun afstand tot een gewenste doelverdeling over dimensies zoals temperatuur, jaar, maand en uur van de dag.
+De gewichten worden berekend als het product van histogram-overlaptermen over alle actieve dimensies, volledig in DuckDB.
+Wanneer een maximumaantal rijen is ingesteld, ontvangt elke partitie een rijenquotum evenredig met haar gewicht, zodat de doelverdeling wordt afgedwongen op het niveau van de SQL-cursor zonder onnodige leeswerk.
+
+\subsection{Ruimtelijke features}
+
+Per batch worden ruimtelijke kenmerken berekend via een 2×2 raamwerk van ruimtelijke en temporele strategieën:
+
+\begin{itemize}
+  \item \textbf{Dichtstbijzijnde punt}: hoogte uit het DHM, waarbij de temporeel meest recente meting vóór het LST-tijdstip wordt geselecteerd (\textit{last previous}).
+  \item \textbf{Radiusaggregatie}: het aantal bomen binnen een instelbare straal (standaard 50~m), eventueel beperkt tot bomen met een gekend aanlegjaar vóór de opnamedatum (zie sectie~\ref{sec:analyse}).
+  \item \textbf{Polygoonfractie}: het aandeel van een cirkelvormig zoekgebied dat bedekt is door een gegeven Urban Atlas-klasse of WIS-wegtype.
+\end{itemize}
+
+Query's worden gededupliceerd op H3-tileidentificator: alle pixels in dezelfde cel delen één queryresultaat, wat de SQL-rondreis-overhead met een factor 100 tot 1000 reduceert.
+
+\subsection{Rasterpreberekening van polygoonfeatures}
+
+De exacte Shapely-intersectiemethode voor polygoonfeatures kost meerdere milliseconden per tile en is onhaalbaar op 725 miljoen rijen.
+Daarom worden de Urban Atlas- en WIS-fracties eenmalig vóór de streamingslus preberekend op een regulier rooster van 15~m.
+Voor elke combinatie van klasse en zoekstraal wordt één rasterlaag gevuld.
+
+Voor Urban Atlas-klassen (relatief weinig, verspreide polygonen) wordt een vectoriële methode gebruikt: per rastercel worden kandidaatpolygonen gefilterd via een STRtree en een vroegtijdige saturatie-afbreek zodra de cirkel volledig bedekt is.
+Voor WIS-wegklassen (honderden tot duizenden aangrenzende kleine polygonen per cel) is dit te traag; daar wordt in de plaats een 2D-FFT-convolutie toegepast: de polygonen worden eerst gerasteriseerd tot een binaire masker op viervoudige resolutie, waarna convolutie met een fractiedekkingsschijfkernel de gewenste breuken levert.
+Dit reduceert de rekentijd van uren naar seconden voor dichte klassen.
+
+De preberekende rasters worden gecacheerd in een DuckDB-bestand, geadresseerd via een SHA-256-hash van de rastergeometrieparameters, zodat herhaalde streamingssessies geen herberekening vereisen.
+
+%---------- Fase 4: Analyse en modellering ------------------------------------
+\section{Analyse en modellering}
+\label{sec:analyse}
+
+\subsection{Causale identificatie via verschil-in-verschillen}
+
+Om het causale effect van boomaanplanting op temperatuur te isoleren, wordt een getrapt verschil-in-verschillen-ontwerp (\textit{staggered difference-in-differences}, DiD) toegepast.
+De behandelingsdosis per LST-pixel is het aantal bomen binnen een bepaalde straal waarvan het aanlegjaar gekend is en kleiner is dan of gelijk aan het opnamejaar van de satellietpassage.
+Deze dosis varieert over de tijd naarmate nieuwe bomen worden aangeplant, wat de temporele variatie levert die nodig is voor causale identificatie.
+
+Circa 73\% van de bomen in de inventaris heeft geen gekend aanlegjaar en valt buiten deze dosisvariabele; zij blijven aanwezig als controlevariabele via de totale boomaantelling binnen de zoekstraal.
+
+\subsection{Regressiemodellen}
+
+De geëxtraheerde dataset bevat per LST-pixel de oppervlaktetemperatuur als uitkomstvariabele, samen met de volgende klassen van verklarende variabelen:
+
+\begin{itemize}
+  \item \textbf{Vergroening}: totaal boomaantal en DiD-behandelingsdosis binnen meerdere straalwaarden.
+  \item \textbf{Landgebruik}: Urban Atlas-fracties per semantische categorie en WIS-fracties per wegbestemming en materiaaltype.
+  \item \textbf{Topografie}: DHM-hoogte van het dichtstbijzijnde punt.
+  \item \textbf{Tijdcomponenten}: jaar, maand, dag van het jaar en uur van de dag.
+\end{itemize}
+
+Omdat de dataset te groot is voor geheugenbewuste batchverwerking, worden de modellen getraind via incrementeel leren (\texttt{partial\_fit}) over opeenvolgende batchframes.
+Hierbij worden zowel lineaire regressie (SGD-geoptimaliseerd) als gradiëntboostingmodellen vergeleken.
+De prestaties worden geëvalueerd op een gereserveerde testset die tijdsgewijs gescheiden is van de trainingsdata om temporele datalekkage te vermijden.
+
+%---------- Technische uitdagingen --------------------------------------------
+\section{Technische uitdagingen}
+\label{sec:uitdagingen}
+
+Dit onderdeel beschrijft de voornaamste technische hindernissen die tijdens de uitvoering zijn opgetreden en de methodologische keuzes hebben beïnvloed.
+Het is bedoeld als verantwoording voor de architecturale keuzes en als context voor toekomstig gelijksoortig onderzoek.
+
+\subsection{Schaal als drijvende ontwerpbeslissing}
+
+De omvang van de LST-dataset vormt de centrale uitdaging van dit onderzoek.
+De ruwe data bevat circa 700 miljoen rijen wanneer ASTER, MODIS en NDVI afzonderlijk worden meegerekend.
+Een naïeve iteratieve aanpak waarbij per rij ruimtelijke features worden berekend, zou bij de goedkoopst geschatte featureberekeningskost letterlijk maanden rekentijd vergen.
+Alle architecturale beslissingen in de ingestie- en streamingsfase zijn in eerste instantie ingegeven door de noodzaak om deze schaal beheersbaar te maken.
+
+Een eerste maatregel was het reduceren van het rijenaantal bij ingestie: door ASTER, MODIS en NDVI per acquisitie samen te voegen via een buitenste verbinding op pixelcoördinaat en de pixels te maskeren tot de exacte Gentse gemeentegrens, daalde het totale rowcount van circa 700 miljoen naar circa 200 miljoen.
+Dit bleek echter onvoldoende: zelfs na deze reductie zou een naïeve streamingsaanpak nog altijd meerdere dagen rekentijd vergen.
+
+\subsection{Keuze van opslagformaat}
+
+De initiële implementatie maakte gebruik van Parquet-bestanden voor de verwerkte LST-data.
+Dit formaat bleek ontoereikend zodra polygoongebaseerde ruimtelijke query's nodig waren: Parquet biedt geen ondersteuning voor spatiale indexering of geometriefuncties.
+Voor de polygoondata (Urban Atlas en WIS) is daarom overgestapt naar SpatiaLite, dat een ingebouwde R-boomindex en geometriefuncties levert.
+
+Omdat SpatiaLite niet geschikt is voor de columnar analytische query's die de streamingspijplijn vereist, werden puntdata in DuckDB opgeslagen.
+De implementatie van polygoonquery's via SpatiaLite vergde aanzienlijk meer ontwikkeltijd dan voorzien: het is een niche datastructuur waarvoor weinig pasklare voorbeeldcode beschikbaar is, waardoor de debugging-cyclus langer was dan voor een meer gangbaar technisch domein.
+
+\subsection{Herarchitectuur van de ingestiepijplijn}
+
+Een vroege versie van de ingestiepijplijn was opgezet als een set van losse Python-scripts per databron.
+Toen het digitaal hoogtemodel en het WIS aan het project werden toegevoegd, bleek het moeilijk om nieuwe, gelijkaardige datasets aan die structuur toe te voegen zonder grootschalige codeduplicatie.
+Dit leidde tot een volledige herstructurering naar een modulaire pijplijn met een centrale orchestrator, een gedeelde database-abstractie en aparte ingestiemodules per databron.
+De herarchitectuur kostte meerdere werkdagen en resulteerde in een volledige vervanging van de bestaande verwerkingsscripts; de commits op dat moment dragen de toepasselijke namen \textit{crying} en \textit{still crying}.
+
+\subsection{Precomputatietijd van polygoonrasters}
+
+De vectoriële methode voor het preberekenen van polygoonrasters nam op een laptop aanvankelijk circa twintig uur in beslag.
+Analyse wees uit dat dit voor de dichte WIS-wegklassen werd veroorzaakt door de O(\textit{cellen} $\times$ \textit{kandidaten})-kostprijs van de GEOS-intersecties per rastercel: elke cel ziet honderden tot duizenden kandidaatpolygonen, en de intersectieberekening schaalt lineair mee.
+
+Voor deze klassen is overgestapt op een FFT-convolutiemethode: alle polygonen worden eerst gerasteriseerd tot een binaire masker op viervoudige resolutie, waarna één enkele convolutie met een analytisch opgebouwde schijfkernel de dekkingsfracties levert.
+Deze aanpak reduceert de berekeningskost tot O(\textit{N} log \textit{N}) onafhankelijk van het aantal kandidaatpolygonen.
+Gecombineerd met de DuckDB-rastercache — waarbij eenmaal berekende lagen bij herhaalde streamingssessies niet opnieuw berekend worden — is de precomputatiefase herleid tot circa twaalf uur voor een volledige eerste run.
+
+\subsection{Wegvallen van de ESTARFM-fusie}
+
+Het oorspronkelijke onderzoeksvoorstel voorzag een ruimtelijk-temporele datafusie via ESTARFM \autocite{Zhu2010} om de lage temporele resolutie van Landsat-LST-data te compenseren.
+Na verdere analyse bleek dat de beschikbare dataset — met acquisities verspreid over 2000 tot 2024 — voldoende tijdspunten bevat voor een robuuste causale analyse.
+ESTARFM is weggelaten omdat het meerwaarde biedt voor puur voorspellende modellen die hoge temporele dekking vereisen, maar niet voor de beschrijvende en causale doelstelling van dit onderzoek.
+
+\subsection{Modelkeuze}
+
+De initiële modelkeuze was gebaseerd op drie criteria: geschiktheid voor incrementeel leren op gestreamde batches, interpreteerbaarheid van feature-importanties en schaalbaarheid naar het verwachte rijenaantal.
+Dit leverde lineaire regressie (SGD), gradient boosting en random forest op als kandidaatmodellen.
+
+Tijdens vroege experimenten domineerde het random forest-model de prestatiemetingen sterk ten opzichte van de overige modellen.
+Dit was onwenselijk: feature-importanties van ensemble-methoden zijn minder transparant dan regressiecoëfficiënten, wat de causale interpretatie bemoeilijkt.
+Na aanpassingen aan de featuretransformaties en de samplingsstrategie van de trainingsdata gedroegen ook de lineaire en boosting-modellen zich robuust, waarna een vergelijkende evaluatie zinvol werd.
 

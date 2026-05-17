@@ -1,0 +1,259 @@
+(src) PS C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src> uv run .\build_test_datasets.py --rebuild
+17:57:35.891  INFO   root - Logging initialized -> logs\stream_2026-05-07_17-57-35.log
+registry: 138 feature descriptors
+
+=== full_representative ===
+    uniform year/month/hour distribution, outlier months excluded
+17:57:35.941  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+17:57:36.032  INFO   stream - catalog: total load time 0.090s
+17:57:36.210  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+17:57:36.211  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+17:57:36.238  INFO   stream - catalog: total load time 0.026s
+17:57:36.240  INFO   stream - _select_partitions: 246 partition_keys, scoring dims: ['year', 'month_of_year', 'hour_of_day']
+17:57:36.265  INFO   stream - _select_partitions: partition_statistics columns = ['dataset_id', 'partition_key', 'tile_id', 'row_count', 'value_min', 'value_max', 'value_mean', 'histogram_counts', 'timestamp_histogram_counts', 'year_histogram_counts', 'month_histogram_counts', 'day_of_month_histogram_counts', 'day_of_year_histogram_counts', 'hour_histogram_counts', 'longitude_histogram_counts', 'latitude_histogram_counts']
+17:57:46.965  INFO   stream - catalog: partition scoring done in 4.737s (246 partitions) dimensions: ['year', 'month_of_year', 'hour_of_day']
+17:57:46.966  INFO   stream - stream: catalog ready, 246 partitions selected in 10.755s
+17:57:46.967  INFO   stream - stream: quota mode — 246 partitions, 5000000 total allocated rows (target 5000000), non-zero: 246
+17:57:46.968  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+17:57:47.007  INFO   stream - stream: LST database opened in 0.038s
+17:57:47.007  INFO   stream - stream: pre-loading SpatiaLite connection ...
+17:57:47.394  INFO   stream - stream: SpatiaLite connection ready in 0.386s
+17:57:47.395  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+17:57:47.395  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+17:57:47.397  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+17:57:47.438  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:08<00:00, 53.92layer/s, computed=0, hit=438] 
+17:57:55.719  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 8.3s
+17:57:55.720  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|█████████████████████████| 246/246 [1:43:09<00:00, 25.16s/partition, pk=2013-03, weight=0.000, yielded=4,981,450, r/s=805, feat_s=30.3s] 
+19:41:04.782  INFO   stream - stream: session complete - 4981450 rows in 6189.1s (805 rows/s)
+build:full_representative: 100%|██████████████████████████████████████████████████████████████████████████▋| 4981450/5000000 [1:43:28<00:23, 802.32row/s] 
+    -> 4,981,450 rows in 6209.1s (802 rows/s)
+
+=== outlier_heat_2006_summer ===
+    natural-density rows from heat_2006_summer months
+19:41:05.070  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+19:41:05.071  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+19:41:05.104  INFO   stream - catalog: total load time 0.033s
+19:41:05.106  INFO   stream - stream: catalog ready, 2 partitions selected in 0.035s
+19:41:05.106  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+19:41:05.128  INFO   stream - stream: LST database opened in 0.020s
+19:41:05.129  INFO   stream - stream: pre-loading SpatiaLite connection ...
+19:41:05.155  INFO   stream - stream: SpatiaLite connection ready in 0.025s
+19:41:05.156  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+19:41:05.157  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+19:41:05.158  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+19:41:05.182  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:10<00:00, 43.07layer/s, computed=0, hit=438] 
+19:41:15.570  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 10.4s
+19:41:15.574  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|███████████████████████████| 2/2 [43:21<00:00, 1300.63s/partition, pk=2006-07, weight=1.000, yielded=2,629,742, r/s=1,011, feat_s=96.5s] 
+20:24:36.955  INFO   stream - stream: session complete - 2629742 rows in 2601.3s (1011 rows/s)
+build:outlier_heat_2006_summer:  53%|█████████████████████████████████████▎                                 | 2629742/5000000 [43:32<39:14, 1006.79row/s] 
+    -> 2,629,742 rows in 2612.0s (1007 rows/s)
+
+=== outlier_warm_2007_apr ===
+    natural-density rows from warm_2007_apr months
+20:24:37.106  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+20:24:37.107  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+20:24:37.149  INFO   stream - catalog: total load time 0.041s
+20:24:37.150  INFO   stream - stream: catalog ready, 1 partitions selected in 0.043s
+20:24:37.150  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+20:24:37.171  INFO   stream - stream: LST database opened in 0.020s
+20:24:37.172  INFO   stream - stream: pre-loading SpatiaLite connection ...
+20:24:37.236  INFO   stream - stream: SpatiaLite connection ready in 0.063s
+20:24:37.237  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+20:24:37.237  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+20:24:37.242  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+20:24:37.268  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:27<00:00, 16.22layer/s, computed=0, hit=438] 
+20:25:04.476  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 27.2s
+20:25:04.477  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|████████████████████████████| 1/1 [18:24<00:00, 1104.14s/partition, pk=2007-04, weight=1.000, yielded=1,090,192, r/s=987, feat_s=109.3s] 
+20:43:28.747  INFO   stream - stream: session complete - 1090192 rows in 1104.1s (987 rows/s)
+build:outlier_warm_2007_apr:  22%|███████████████▉                                                         | 1090192/5000000 [18:51<1:07:38, 963.28row/s] 
+    -> 1,090,192 rows in 1131.8s (963 rows/s)
+
+=== outlier_cold_2010_winter ===
+    natural-density rows from cold_2010_winter months
+20:43:28.899  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+20:43:28.899  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+20:43:28.941  INFO   stream - catalog: total load time 0.041s
+20:43:28.942  INFO   stream - stream: catalog ready, 0 partitions selected in 0.043s
+20:43:28.943  WARNING  stream - stream: no partitions selected - nothing to stream
+build:outlier_cold_2010_winter:   0%|                                                                                       | 0/5000000 [00:00<?, ?row/s] 
+    -> 0 rows in 0.0s (0 rows/s)
+
+=== outlier_cold_2012_feb ===
+    natural-density rows from cold_2012_feb months
+20:43:28.949  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+20:43:28.950  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+20:43:28.958  INFO   stream - catalog: total load time 0.007s
+20:43:28.960  INFO   stream - stream: catalog ready, 1 partitions selected in 0.010s
+20:43:28.960  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+20:43:28.983  INFO   stream - stream: LST database opened in 0.022s
+20:43:28.984  INFO   stream - stream: pre-loading SpatiaLite connection ...
+20:43:29.013  INFO   stream - stream: SpatiaLite connection ready in 0.028s
+20:43:29.104  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+20:43:29.106  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+20:43:29.107  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+20:43:29.163  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:10<00:00, 42.08layer/s, computed=0, hit=438] 
+20:43:39.929  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 10.8s
+20:43:39.946  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|███████████████████████████████| 1/1 [03:24<00:00, 204.02s/partition, pk=2012-02, weight=1.000, yielded=122,320, r/s=600, feat_s=181.7s] 
+20:47:04.238  INFO   stream - stream: session complete - 122320 rows in 204.0s (600 rows/s)
+build:outlier_cold_2012_feb:   2%|█▊                                                                        | 122320/5000000 [03:35<2:23:09, 567.89row/s] 
+    -> 122,320 rows in 215.4s (568 rows/s)
+
+=== outlier_heat_2013_summer ===
+    natural-density rows from heat_2013_summer months
+20:47:04.359  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+20:47:04.360  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+20:47:04.382  INFO   stream - catalog: total load time 0.021s
+20:47:04.383  INFO   stream - stream: catalog ready, 2 partitions selected in 0.023s
+20:47:04.383  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+20:47:04.402  INFO   stream - stream: LST database opened in 0.018s
+20:47:04.403  INFO   stream - stream: pre-loading SpatiaLite connection ...
+20:47:04.466  INFO   stream - stream: SpatiaLite connection ready in 0.062s
+20:47:04.467  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+20:47:04.468  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+20:47:04.473  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+20:47:04.501  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:10<00:00, 42.23layer/s, computed=0, hit=438] 
+20:47:15.020  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 10.5s
+20:47:15.021  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|███████████████████████████████| 2/2 [19:31<00:00, 585.75s/partition, pk=2013-08, weight=1.000, yielded=998,203, r/s=852, feat_s=126.7s] 
+21:06:46.652  INFO   stream - stream: session complete - 998203 rows in 1171.5s (852 rows/s)
+build:outlier_heat_2013_summer:  20%|██████████████▏                                                        | 998203/5000000 [19:42<1:19:00, 844.24row/s] 
+    -> 998,203 rows in 1182.4s (844 rows/s)
+
+=== outlier_heat_2015_summer ===
+    natural-density rows from heat_2015_summer months
+21:06:46.735  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+21:06:46.736  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+21:06:46.747  INFO   stream - catalog: total load time 0.010s
+21:06:46.748  INFO   stream - stream: catalog ready, 2 partitions selected in 0.012s
+21:06:46.749  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+21:06:46.770  INFO   stream - stream: LST database opened in 0.020s
+21:06:46.771  INFO   stream - stream: pre-loading SpatiaLite connection ...
+21:06:46.790  INFO   stream - stream: SpatiaLite connection ready in 0.018s
+21:06:46.791  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+21:06:46.791  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+21:06:46.792  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+21:06:46.823  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:08<00:00, 51.74layer/s, computed=0, hit=438] 
+21:06:55.429  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 8.6s
+21:06:55.430  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|████████████████████████████| 2/2 [41:36<00:00, 1248.10s/partition, pk=2015-08, weight=1.000, yielded=2,441,449, r/s=978, feat_s=109.8s] 
+21:48:31.761  INFO   stream - stream: session complete - 2441449 rows in 2496.2s (978 rows/s)
+build:outlier_heat_2015_summer:  49%|███████████████████████████████████▏                                    | 2441449/5000000 [41:45<43:45, 974.58row/s] 
+    -> 2,441,449 rows in 2505.1s (975 rows/s)
+
+=== outlier_drought_2018 ===
+    natural-density rows from drought_2018 months
+21:48:31.876  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+21:48:31.877  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+21:48:31.884  INFO   stream - catalog: total load time 0.007s
+21:48:31.885  INFO   stream - stream: catalog ready, 4 partitions selected in 0.008s
+21:48:31.886  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+21:48:31.923  INFO   stream - stream: LST database opened in 0.036s
+21:48:31.924  INFO   stream - stream: pre-loading SpatiaLite connection ...
+21:48:32.289  INFO   stream - stream: SpatiaLite connection ready in 0.364s
+21:48:32.290  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+21:48:32.291  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+21:48:32.293  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+21:48:32.328  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:08<00:00, 50.43layer/s, computed=0, hit=438] 
+21:48:41.154  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 8.8s
+21:48:41.155  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+23:16:19.410  INFO   stream - stream: early stop after 5000000 rows (max_rows=5000000)
+Partitions:  75%|███████████████████▌      | 3/4 [1:27:38<29:12, 1752.71s/partition, pk=2018-08, weight=1.000, yielded=5,000,000, r/s=951, feat_s=112.8s] 
+23:16:19.412  INFO   stream - stream: session complete - 5000000 rows in 5258.1s (951 rows/s)
+build:outlier_drought_2018: 100%|██████████████████████████████████████████████████████████████████████████| 5000000/5000000 [1:27:47<00:00, 949.18row/s] 
+    -> 5,000,000 rows in 5267.7s (949 rows/s)
+
+=== outlier_heat_2019_jun_jul ===
+    natural-density rows from heat_2019_jun_jul months
+23:16:19.591  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+23:16:19.592  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+23:16:19.600  INFO   stream - catalog: total load time 0.007s
+23:16:19.600  INFO   stream - stream: catalog ready, 2 partitions selected in 0.009s
+23:16:19.601  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+23:16:19.621  INFO   stream - stream: LST database opened in 0.019s
+23:16:19.622  INFO   stream - stream: pre-loading SpatiaLite connection ...
+23:16:19.644  INFO   stream - stream: SpatiaLite connection ready in 0.021s
+23:16:19.645  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+23:16:19.646  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]
+23:16:19.647  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+23:16:19.673  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:09<00:00, 45.54layer/s, computed=0, hit=438] 
+23:16:29.458  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 9.8s
+23:16:29.459  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|████████████████████████████| 2/2 [44:25<00:00, 1332.62s/partition, pk=2019-07, weight=1.000, yielded=2,562,926, r/s=962, feat_s=107.8s] 
+00:00:54.831  INFO   stream - stream: session complete - 2562926 rows in 2663.9s (962 rows/s)
+build:outlier_heat_2019_jun_jul:  51%|████████████████████████████████████▍                                  | 2562926/5000000 [44:35<42:23, 957.97row/s] 
+    -> 2,562,926 rows in 2674.1s (958 rows/s)
+
+=== outlier_heat_2020_aug ===
+    natural-density rows from heat_2020_aug months
+00:00:54.994  INFO   stream - stream: starting - batch_size=100000, max_rows=5000000, features=138 (batch=138 row=0)
+00:00:54.995  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+00:00:55.002  INFO   stream - catalog: total load time 0.006s
+00:00:55.003  INFO   stream - stream: catalog ready, 1 partitions selected in 0.008s
+00:00:55.004  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+00:00:55.023  INFO   stream - stream: LST database opened in 0.018s
+00:00:55.024  INFO   stream - stream: pre-loading SpatiaLite connection ...
+00:00:55.045  INFO   stream - stream: SpatiaLite connection ready in 0.020s
+00:00:55.046  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+00:00:55.047  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+00:00:55.048  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+00:00:55.076  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:09<00:00, 46.82layer/s, computed=0, hit=438] 
+00:01:04.575  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 9.5s
+00:01:04.577  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions: 100%|███████████████████████████████| 1/1 [15:53<00:00, 953.88s/partition, pk=2020-08, weight=1.000, yielded=882,664, r/s=925, feat_s=113.7s] 
+00:16:58.585  INFO   stream - stream: session complete - 882664 rows in 953.9s (925 rows/s)
+build:outlier_heat_2020_aug:  18%|█████████████                                                             | 882664/5000000 [16:03<1:14:55, 915.92row/s] 
+    -> 882,664 rows in 963.7s (916 rows/s)
+
+=== hour_midday ===
+    rows in hour_of_day in [10.0, 11.0] (Landsat/ASTER daytime pass)
+00:16:58.712  INFO   stream - stream: starting - batch_size=100000, max_rows=None, features=138 (batch=138 row=0)
+00:16:58.713  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+00:16:58.721  INFO   stream - catalog: total load time 0.008s
+00:16:58.723  INFO   stream - stream: catalog ready, 261 partitions selected in 0.010s
+00:16:58.723  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+00:16:58.743  INFO   stream - stream: LST database opened in 0.019s
+00:16:58.744  INFO   stream - stream: pre-loading SpatiaLite connection ...
+00:16:58.764  INFO   stream - stream: SpatiaLite connection ready in 0.019s
+00:16:58.765  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+00:16:58.765  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+00:16:58.766  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+00:16:58.791  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:10<00:00, 43.12layer/s, computed=0, hit=438] 
+00:17:09.150  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 10.4s
+00:17:09.151  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions:   0%|                                      | 0/261 [03:32<?, ?partition/s, pk=2000-02, weight=1.000, yielded=100,000, r/s=944, feat_s=104.4s] 
+00:20:41.255  INFO   stream - stream: session complete - 100000 rows in 212.0s (472 rows/s)
+build:hour_midday: 100%|███████████████████████████████████████████████████████████████████████████████████████| 200000/200000 [03:42<00:00, 898.05row/s] 
+    -> 200,000 rows in 222.7s (898 rows/s)
+
+=== hour_midnight ===
+    rows in hour_of_day in [22.0, 23.0] (MODIS-Terra nighttime pass)
+00:20:41.444  INFO   stream - stream: starting - batch_size=100000, max_rows=None, features=138 (batch=138 row=0)
+00:20:41.445  INFO   stream - catalog: loading from C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\catalog.duckdb
+00:20:41.470  INFO   stream - catalog: total load time 0.023s
+00:20:41.471  INFO   stream - stream: catalog ready, 261 partitions selected in 0.025s
+00:20:41.471  INFO   stream - stream: opening LST database C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\prepared_stream_data\lst.duckdb
+00:20:41.491  INFO   stream - stream: LST database opened in 0.019s
+00:20:41.492  INFO   stream - stream: pre-loading SpatiaLite connection ...
+00:20:41.516  INFO   stream - stream: SpatiaLite connection ready in 0.023s
+00:20:41.518  INFO   stream - raster: using fixed Ghent bbox lon=[3.5700, 3.8600] lat=[50.9600, 51.2100]
+00:20:41.519  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 0 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]        
+00:20:41.519  INFO   stream - raster cache: grid_key=5178db3265bfa561  db=C:\Users\liamv\Desktop\School\syll\bp\repo\latex-hogent-bachproef-Liam_Van_Rie\src\stream_cache\rasters\raster_cache.duckdb
+00:20:41.546  INFO   stream - raster: 324 UA layer(s) + 114 WIS layer(s), 1358 x 1859 = 2524522 grid cells at 15 m resolution
+Raster layers: 100%|███████████████████████████████████████████████████████████████████████████| 438/438 [00:08<00:00, 54.70layer/s, computed=0, hit=438] 
+00:20:49.768  INFO   stream - raster: done — 438 hit(s) from cache, 0 computed, 2524522 total cells, 8.2s
+00:20:49.769  INFO   stream - PolyRaster: 15 m grid, 1358 x 1859 cells (0.29 x 0.25 deg), 146 layers, bbox lon=[3.5698,3.8603] lat=[50.9599,51.2102]      
+Partitions:  21%|██████▉                          | 55/261 [6:28:49<32:49:04, 573.52s/partition, pk=2005-11, weight=1.000, quota=all, yielded=30,195,257]

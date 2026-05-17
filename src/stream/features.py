@@ -618,7 +618,7 @@ def urban_atlas_classifications_fractions(
                 if raster is not None:
                     # Fast path: O(1) raster lookup per row
                     if ua_year is not None:
-                        layer_key = f"{luc_code}:{ua_year}"
+                        layer_key = f"{luc_code}:{ua_year}:r{int(radius_m)}m"
                         code_frac = np.array(
                             [raster.lookup(lons[i], lats[i], layer_key) or 0.0
                              for i in range(n)],
@@ -627,7 +627,8 @@ def urban_atlas_classifications_fractions(
                     else:
                         code_frac = np.array(
                             [raster.lookup_ua_last_previous(
-                                 lons[i], lats[i], luc_code, int(tss[i][:4])) or 0.0
+                                 lons[i], lats[i], luc_code, int(tss[i][:4]),
+                                 radius_m) or 0.0
                              for i in range(n)],
                             dtype=np.float32,
                         )
@@ -648,7 +649,7 @@ def urban_atlas_classifications_fractions(
 
             # Cap aggregate at 1.0 (polygons of different codes may overlap)
             total_frac = np.minimum(total_frac, 1.0)
-            col_name = f"{_prefix}{classification}_{int(radius_m)}m_frac"
+            col_name = f"{classification}_{int(radius_m)}m_frac"
             result_cols[col_name] = total_frac
 
         return pd.DataFrame(result_cols, index=df.index)
@@ -685,10 +686,8 @@ def urban_atlas_classifications_fractions(
     desc._classification_map = norm_map
     desc._radius_m          = radius_m
     desc._ua_year           = ua_year
-    # Names mirror what compute_batch produces: the inner _batch builds keys
-    # already prefixed with _prefix, then compute_batch prefixes again.
     desc._output_columns    = [
-        f"{_prefix}{_prefix}{cls}_{int(radius_m)}m_frac"
+        f"{_prefix}{cls}_{int(radius_m)}m_frac"
         for cls in norm_map
     ]
     desc._value_range       = (0.0, 1.0)
@@ -733,7 +732,7 @@ def wis_fraction(
     _PolyRaster is available, lookups are O(1).
     """
     safe_val = attr_val.replace(" ", "_").replace("/", "_")
-    out_col  = f"wis_{safe_val}_{int(radius_m)}m_frac"
+    out_col  = f"{safe_val}_{int(radius_m)}m_frac"
     _prefix  = prefix or "wis_"
 
     _raster_ref: List[Optional[_PolyRaster]] = [None]
@@ -762,7 +761,7 @@ def wis_fraction(
     desc._attr_col     = attr_col
     desc._attr_val     = attr_val
     desc._radius_m     = radius_m
-    desc._output_columns = [f"{_prefix}{out_col}"]
+    desc._output_columns = [f"{_prefix}{out_col}"]   # = wis_{safe_val}_{r}m_frac
     desc._value_range    = (0.0, 1.0)
     desc._scaler_hint    = "minmax"
     return desc

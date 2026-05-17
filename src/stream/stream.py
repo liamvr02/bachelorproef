@@ -203,6 +203,7 @@ class StreamConfig:
         batch_size: int = 10_000,
         partition_keys: Optional[List[str]] = None,
         raster_resolution_m: float = 15.0,
+        raster_fft: bool = True,
         lst_emissivity_mode: str = "any",
         lst_null_handling: str = "skip",
     ):
@@ -219,6 +220,13 @@ class StreamConfig:
                                well inside the acceptable margin for any query
                                radius >= 100 m.  Set 0 to disable precomputation
                                and always use the live Shapely path.
+        raster_fft           : Use FFT convolution to rasterise polygon layers
+                               (default True).  FFT cost is dominated by one
+                               2-D convolution regardless of polygon count, so
+                               it is faster than the vector path for any class
+                               with more than ~20 polygons in the grid extent.
+                               Set False to force the Shapely vector path
+                               (useful for debugging or very sparse UA classes).
         lst_emissivity_mode  : How to select LST value from 3 emissivity sources:
                                "any" (default): first non-null (ASTER > MODIS > NDVI)
                                "fallback": ASTER > MODIS, never NDVI
@@ -234,6 +242,7 @@ class StreamConfig:
         self.batch_size          = batch_size
         self._partitions         = partition_keys   # None -> all
         self.raster_resolution_m = raster_resolution_m
+        self.raster_fft          = raster_fft
         self.lst_emissivity_mode = lst_emissivity_mode
         self.lst_null_handling   = lst_null_handling
         self._distribution: Optional[DistributionTarget] = None
@@ -751,17 +760,18 @@ class StreamConfig:
                 tag = f"[{layer_idx}/{n_total_layers}]"
                 if layer_type == "ua":
                     luc_code, layer_radius_m, year = spec
-                    layer_key = f"{luc_code}:{year}"
-                    cache_layer_key = layer_key
+                    layer_key = f"{luc_code}:{year}:r{int(layer_radius_m)}m"
                 elif layer_type == "wis":
                     attr_col, attr_val, layer_radius_m = spec
-                    layer_key = f"wis:{attr_val}"
-                    # WIS now uses the FFT rasteriser; tag the cache key so
-                    # stale entries from the old vector path are skipped.
-                    cache_layer_key = f"fft:{layer_key}"
+                    layer_key = f"wis:{attr_val}:r{int(layer_radius_m)}m"
                 else:
                     layer_bar.update(1)
                     continue
+
+                # Prefix the cache key with the rasteriser variant so that
+                # switching raster_fft forces a recompute rather than a
+                # silent hit from an entry built with the other path.
+                cache_layer_key = ("fft:" if self.raster_fft else "vec:") + layer_key
 
                 # --- cache hit? ---
                 if cache_conn is not None:
@@ -822,21 +832,13 @@ class StreamConfig:
                 )
 
                 t_rast = time.perf_counter()
-                # Dispatch: WIS classes are dense (thousands of small adjacent
-                # road polygons within radius) — use FFT convolution path.
-                # UA stays on the vector path: most LUC codes are sparse and
-                # the FFT setup cost is a net loss when only a handful of
-                # polygons are involved.
-                if layer_type == "wis":
-                    n_nonzero = _rasterise_layer_fft(
-                        arr, raster, all_blobs, layer_radius_m,
-                        desc=tqdm_desc,
-                    )
-                else:
-                    n_nonzero = _rasterise_layer(
-                        arr, raster, all_blobs, layer_radius_m,
-                        desc=tqdm_desc,
-                    )
+                _rasterise = (
+                    _rasterise_layer_fft if self.raster_fft else _rasterise_layer
+                )
+                n_nonzero = _rasterise(
+                    arr, raster, all_blobs, layer_radius_m,
+                    desc=tqdm_desc,
+                )
                 t_rast = time.perf_counter() - t_rast
                 raster._coverage[layer_key] = n_nonzero
                 elapsed = time.perf_counter() - t_layer

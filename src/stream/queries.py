@@ -847,7 +847,7 @@ def batch_urban_atlas_luc_fraction(
     # ---- Fast path: O(n) raster lookup ----
     if raster is not None:
         if ua_year is not None:
-            layer_key = f"{luc_code}:{ua_year}"
+            layer_key = f"{luc_code}:{ua_year}:r{int(radius_m)}m"
             values = np.array(
                 [raster.lookup(lons[i], lats[i], layer_key) or 0.0
                  for i in range(len(df))],
@@ -857,7 +857,8 @@ def batch_urban_atlas_luc_fraction(
             tss = df["timestamp"].to_numpy(dtype=str)
             values = np.array(
                 [raster.lookup_ua_last_previous(
-                     lons[i], lats[i], luc_code, int(tss[i][:4])) or 0.0
+                     lons[i], lats[i], luc_code, int(tss[i][:4]),
+                     radius_m) or 0.0
                  for i in range(len(df))],
                 dtype=float,
             )
@@ -914,7 +915,7 @@ def batch_wis_fraction(
     # ---- Fast path: O(n) raster lookup ----
     if raster is not None:
         values = np.array(
-            [raster.lookup_wis(lons[i], lats[i], attr_val) or 0.0
+            [raster.lookup_wis(lons[i], lats[i], attr_val, radius_m) or 0.0
              for i in range(len(df))],
             dtype=float,
         )

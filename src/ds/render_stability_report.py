@@ -2,7 +2,7 @@
 render_stability_report.py
 ==========================
 
-Cross-dataset stability analysis of feature correlations from ds_test_results.json.
+Cross-dataset stability analysis of feature correlations from ds_reports/cross_corr.json.
 
 A correlation is considered "stable" if its magnitude is consistent across many
 independent data slices.  This script aggregates the per-pair metrics from every
@@ -38,8 +38,8 @@ Output
 
 Usage
 -----
-    python src/render_stability_report.py
-    python src/render_stability_report.py --results src/ds_test_results.json
+    python src/ds/render_stability_report.py
+    python src/ds/render_stability_report.py --results src/ds_reports/cross_corr.json
 """
 
 from __future__ import annotations
@@ -52,13 +52,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-_SRC              = Path(__file__).parent
-_RESULTS          = _SRC / "ds_test_results.json"
-_OUT_DIR          = _SRC / "ds_reports"
-_STABILITY_JSON   = _SRC / "ds_test_stability.json"
+_DS_DIR            = Path(__file__).parent
+_SRC               = _DS_DIR.parent
+_RESULTS           = _SRC / "ds_reports" / "cross_corr.json"
+_OUT_DIR           = _SRC / "ds_reports"
+_STABILITY_JSON    = _SRC / "ds_test_stability.json"
 
-_FULL_ROW_THRESH  = 10_000   # datasets below this are "spatial"
-_SOURCE_ORDER     = ["LST", "DHM", "Trees", "UA", "WIS"]
+_FULL_ROW_THRESH   = 10_000
+_SOURCE_ORDER      = ["LST", "DHM", "Trees", "UA", "WIS"]
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +82,6 @@ def aggregate(results: dict) -> Tuple[List[dict], dict]:
     """
     full_names, spatial_names = _split_datasets(results)
 
-    # Collect per-pair values from full and spatial datasets separately.
     full_vals:    Dict[Tuple, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
     spatial_vals: Dict[Tuple, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
     datasets_seen: Dict[Tuple, Dict[str, List[str]]] = defaultdict(lambda: {"full": [], "spatial": []})
@@ -127,7 +127,7 @@ def aggregate(results: dict) -> Tuple[List[dict], dict]:
     pair_stats = []
     all_keys = sorted(
         set(full_vals.keys()) | set(spatial_vals.keys()),
-        key=lambda k: (k[1], k[3], k[0], k[2]),   # sort by source pair then names
+        key=lambda k: (k[1], k[3], k[0], k[2]),
     )
 
     for key in all_keys:
@@ -147,8 +147,6 @@ def aggregate(results: dict) -> Tuple[List[dict], dict]:
         stability = round(max(0.0, 1.0 - ps_full.get("cv", 1.0)), 4) if ps_full else None
         sign_pct  = _sign_pct(pr_full)
 
-        # Spatial agreement: do spatial pearson_r values have the same sign as
-        # the full-dataset mean?
         full_sign = 1 if sum(pr_full) > 0 else -1 if pr_full else 0
         spatial_agree = None
         if pr_spat and full_sign != 0:
@@ -181,7 +179,7 @@ def aggregate(results: dict) -> Tuple[List[dict], dict]:
 
 
 # ---------------------------------------------------------------------------
-# Colour / format helpers  (same palette as render_ds_reports.py)
+# Colour / format helpers
 # ---------------------------------------------------------------------------
 
 def _lerp(lo, hi, t):
@@ -203,7 +201,6 @@ def _r_col(v):
     return _hex(_lerp(_lerp(_WHITE, _ORANGE, v / 0.5), _lerp(_ORANGE, _RED, (v - 0.5) / 0.5), 1 if v > 0.5 else 0))
 
 def _cv_col(cv):
-    """Green (low CV = stable) -> yellow -> red (high CV = unstable)."""
     t = min(1.0, cv / 1.5)
     if t < 0.5:
         return _hex(_lerp(_GREEN, _YELLOW, t / 0.5))
@@ -214,7 +211,6 @@ def _mi_col(v, max_v):
     return _hex(_lerp(_WHITE, _BLUE, t))
 
 def _stab_col(s):
-    """1=green, 0=red."""
     return _hex(_lerp(_RED, _GREEN, s))
 
 def _fmt(v, d=3):
@@ -231,7 +227,7 @@ def _pm(s: dict, key="mean", sd_key="std") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Heatmap helpers (mean of a field over all pairs in a source pair)
+# Heatmap helpers
 # ---------------------------------------------------------------------------
 
 def _heatmap_data(pair_stats, get_val):
@@ -337,7 +333,7 @@ def _pair_rows(pair_stats: List[dict], max_mi: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CSS + JS (shared palette; stability-specific additions)
+# CSS + JS
 # ---------------------------------------------------------------------------
 
 _CSS = """
@@ -412,7 +408,7 @@ _JS = """
     var tbody  = table.querySelector('tbody');
     var ths    = table.querySelectorAll('thead th');
     if (sortCol === col) { sortAsc = !sortAsc; }
-    else { sortCol = col; sortAsc = col < 4; }  // text cols asc, num cols desc
+    else { sortCol = col; sortAsc = col < 4; }
     ths.forEach(function(th, i) {
       th.className = i === col ? (sortAsc ? 'sorted-asc' : 'sorted-desc') : '';
     });
@@ -467,7 +463,6 @@ _JS = """
       document.getElementById(id).addEventListener('input', applyFilter);
       document.getElementById(id).addEventListener('change', applyFilter);
     });
-    // Apply initial sort (stability desc)
     doSort(9);
     updateCount();
   });
@@ -493,7 +488,6 @@ def render(pair_stats: List[dict], agg_meta: dict, results_meta: dict,
 
     max_mi = max((p["mi"].get("mean") or 0) for p in pair_stats) or 1.0
 
-    # Heatmaps
     hm_r    = _heatmap_data(pair_stats, lambda p: p["pearson"].get("mean"))
     hm_cv   = _heatmap_data(pair_stats, lambda p: p["pearson"].get("cv"))
     hm_stab = _heatmap_data(pair_stats, lambda p: p.get("stability"))
@@ -511,7 +505,6 @@ def render(pair_stats: List[dict], agg_meta: dict, results_meta: dict,
         "</div></div>"
     )
 
-    # Legend
     legend_html = (
         "<div class='legend'>"
         "<div><span class='legend-swatch' "
@@ -526,7 +519,6 @@ def render(pair_stats: List[dict], agg_meta: dict, results_meta: dict,
         "</div>"
     )
 
-    # Summary meta box
     n_strong_stable = sum(
         1 for p in pair_stats
         if (p["pearson"].get("mean") or 0) >= 0.2
@@ -545,7 +537,6 @@ def render(pair_stats: List[dict], agg_meta: dict, results_meta: dict,
         "</div>"
     )
 
-    # Controls
     src_opts = _source_opts(sources)
     controls_html = (
         "<div class='controls'>"
@@ -560,7 +551,6 @@ def render(pair_stats: List[dict], agg_meta: dict, results_meta: dict,
         "</div>"
     )
 
-    # Table
     table_html = (
         "<div class='table-wrap'>"
         "<table class='pairs' id='pairs-table'>"

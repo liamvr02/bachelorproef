@@ -58,10 +58,25 @@ class PointFilterStream:
         batch_size: Optional[int] = None,
         max_rows: Optional[int] = None,
     ) -> Generator[pd.DataFrame, None, None]:
+        # max_rows caps OUTPUT rows (post-predicate), not scan rows.
+        # The underlying scan runs unbounded so that sparse filters (spatial
+        # points, specific hours) cover the full temporal range rather than
+        # stopping after the first few partitions.
+        n_output = 0
         for df in self._cfg.stream(registry, batch_size=batch_size, max_rows=max_rows):
             filtered = df.loc[self._predicate(df)]
-            if not filtered.empty:
-                yield filtered
+            if filtered.empty:
+                continue
+            if max_rows is not None:
+                remaining = max_rows - n_output
+                if remaining <= 0:
+                    return
+                if len(filtered) > remaining:
+                    filtered = filtered.iloc[:remaining]
+            yield filtered
+            n_output += len(filtered)
+            if max_rows is not None and n_output >= max_rows:
+                return
 
     def set_distribution(self, dist: dict) -> None:
         self._cfg.set_distribution(dist)
